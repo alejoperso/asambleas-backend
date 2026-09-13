@@ -19,16 +19,11 @@ const io = new Server(server, {
 });
 
 // MAPAS DE ESTADO EN MEMORIA (Optimizado para latencia < 500ms)
-// Estructura: activeQuestions.get(assemblyId)
 const activeQuestions = new Map();
-
-// Estructura: timerIntervals.get(assemblyId)
 const timerIntervals = new Map();
-
-// Control de Sesión Única global: Map<"assemblyId_userId", socketId>
 const activeSessions = new Map();
 
-// Helper: Calcular resultados ponderados por coeficiente para una asamblea
+// Helper: Calcular resultados ponderados por coeficiente
 async function calculateWeightedResults(assemblyId, preguntaId) {
   const [votos] = await db.query(
     `SELECT v.opcion_id, u.coeficiente 
@@ -76,22 +71,26 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
   console.log(`🔌 Nuevo cliente conectado: ${socket.id}`);
 
-  // 1. UNIRSE A UNA ASAMBLEA Y AUTENTICAR (SESIÓN ÚNICA + SALA MULTI-TENANT)
-  socket.on('auth:join', async ({ assemblyId, userId }) => {
+  // 1. UNIRSE A UNA ASAMBLEA Y AUTENTICAR POR IDENTIFICADOR ÚNICO
+  socket.on('auth:join', async ({ assemblyId, identificadorUnico }) => {
     try {
+      const targetAssembly = assemblyId || 1;
+      const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
+
       const [rows] = await db.query(
         `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol 
          FROM usuarios 
-         WHERE assembly_id = ? AND id = ?`,
-        [assemblyId, userId]
+         WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
+        [targetAssembly, targetId]
       );
 
       if (rows.length === 0) {
-        return socket.emit('auth:error', 'Usuario o Asamblea no válidos.');
+        return socket.emit('auth:error', 'El identificador digitado no se encuentra en el padrón electoral.');
       }
 
       const user = rows[0];
-      const sessionKey = `${assemblyId}_${userId}`;
+      const userId = user.id;
+      const sessionKey = `${targetAssembly}_${userId}`;
 
       // CONTROL DE SESIÓN ÚNICA: Desconectar dispositivo anterior si existe
       if (activeSessions.has(sessionKey)) {
@@ -104,27 +103,26 @@ io.on('connection', (socket) => {
       // Registrar nueva sesión
       activeSessions.set(sessionKey, socket.id);
       socket.sessionKey = sessionKey;
-      socket.assemblyId = assemblyId;
+      socket.assemblyId = targetAssembly;
       socket.userId = userId;
 
       // Unir socket a la sala privada de esta copropiedad
-      const roomName = `assembly_${assemblyId}`;
+      const roomName = `assembly_${targetAssembly}`;
       socket.join(roomName);
 
       // Actualizar socket_id en BD
       await db.query(`UPDATE usuarios SET last_socket_id = ? WHERE id = ?`, [socket.id, userId]);
 
-      // Enviar confirmación al usuario
+      // Enviar confirmación exitosa al usuario
       socket.emit('auth:success', {
         user,
         room: roomName
       });
 
       // Si hay una pregunta activa corriendo en esta asamblea, enviársela al usuario
-      if (activeQuestions.has(assemblyId)) {
-        const activeQ = activeQuestions.get(assemblyId);
+      if (activeQuestions.has(targetAssembly)) {
+        const activeQ = activeQuestions.get(targetAssembly);
         
-        // Consultar si este usuario ya votó en esta pregunta
         const [votoUsuario] = await db.query(
           `SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`,
           [activeQ.id, userId]
@@ -136,25 +134,22 @@ io.on('connection', (socket) => {
         });
       }
 
-      console.log(`✅ ${user.nombre_completo} unido a la sala: ${roomName}`);
+      console.log(`✅ ${user.nombre_completo} (${user.identificador_unico}) unido a la sala: ${roomName}`);
     } catch (error) {
       console.error('Error en auth:join:', error);
-      socket.emit('auth:error', 'Error en la verificación de credenciales.');
+      socket.emit('auth:error', 'Error en el servidor al verificar credenciales.');
     }
   });
 
   // 2. ADMINISTRADOR: ABRIR VOTACIÓN CON CRONÓMETRO
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
     try {
-      // Detener cronómetro anterior si existía
       if (timerIntervals.has(assemblyId)) {
         clearInterval(timerIntervals.get(assemblyId));
       }
 
-      // Marcar pregunta como activa en BD
       await db.query(`UPDATE preguntas SET estado = 'activa' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
 
-      // Consultar detalle de pregunta y opciones
       const [preguntas] = await db.query(`SELECT id, texto_pregunta FROM preguntas WHERE id = ?`, [preguntaId]);
       const [opciones] = await db.query(`SELECT id, texto_opcion FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`, [preguntaId]);
 
@@ -170,13 +165,10 @@ io.on('connection', (socket) => {
       };
 
       activeQuestions.set(assemblyId, activeQData);
-
       const roomName = `assembly_${assemblyId}`;
 
-      // Emitir inicio de votación a toda la copropiedad
       io.to(roomName).emit('voting:started', activeQData);
 
-      // INICIAR CRONÓMETRO REGRESIVO EN EL SERVIDOR
       const interval = setInterval(async () => {
         const currentQ = activeQuestions.get(assemblyId);
 
@@ -186,20 +178,14 @@ io.on('connection', (socket) => {
         }
 
         currentQ.tiempoRestante -= 1;
-
-        // Notificar tick de reloj a los conectados de esta asamblea
         io.to(roomName).emit('timer:tick', { tiempoRestante: currentQ.tiempoRestante });
 
-        // AL LLEGAR A CERO: CERRAR VOTACIÓN
         if (currentQ.tiempoRestante <= 0) {
           clearInterval(interval);
           timerIntervals.delete(assemblyId);
           currentQ.isOpen = false;
 
-          // Cambiar estado en BD a 'cerrada'
           await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ?`, [preguntaId]);
-
-          // Calcular resultados finales por coeficiente
           const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
 
           io.to(roomName).emit('voting:closed', {
@@ -233,14 +219,11 @@ io.on('connection', (socket) => {
     }
 
     try {
-      // Obtenemos coeficiente del usuario
       const [u] = await db.query(`SELECT coeficiente FROM usuarios WHERE id = ?`, [userId]);
       if (u.length === 0) return;
 
       const coef = u[0].coeficiente;
 
-      // INSERT ON DUPLICATE KEY UPDATE: 
-      // Si el usuario ya votó, actualiza la opción y la marca de tiempo; si no, inserta.
       await db.query(
         `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
          VALUES (?, ?, ?, ?, ?)
@@ -248,10 +231,8 @@ io.on('connection', (socket) => {
         [assemblyId, currentQ.id, userId, opcionId, coef]
       );
 
-      // Confirmar al votante
       socket.emit('vote:confirmed', { opcionId });
 
-      // Calcular y transmitir resultados en vivo a la sala de la asamblea
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
       io.to(`assembly_${assemblyId}`).emit('voting:results_update', { resultados: updatedResults });
 
@@ -261,7 +242,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 4. DESCONEXIÓN DE USUARIO
+  // 4. DESCONEXIÓN
   socket.on('disconnect', () => {
     if (socket.sessionKey && activeSessions.get(socket.sessionKey) === socket.id) {
       activeSessions.delete(socket.sessionKey);
