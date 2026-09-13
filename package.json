@@ -1,0 +1,9 @@
+PORT=3000
+NODE_ENV=development
+
+DB_HOST=localhost
+DB_USER=ajaudiov_asambleas
+DB_PASS=Alfaleon2026
+DB_NAME=ajaudiov_asambleas
+
+APP_URL=https://asambleas.ajaudiovisual.com
