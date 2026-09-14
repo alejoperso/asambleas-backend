@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -19,7 +20,7 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// HELPER: CONVERTIDOR AUTOMÁTICO A LA RUTA OFICIAL DE EMBED WEB DE ZOOM (/wc/join/)
+// HELPER: CONVERTIDOR Y EXTRACTOR DE CONTRASEÑA ZOOM (/wc/join/)
 function formatZoomEmbedUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
   let url = rawUrl.trim();
@@ -29,9 +30,9 @@ function formatZoomEmbedUrl(rawUrl) {
     if (meetingIdMatch && meetingIdMatch[1]) {
       const meetingId = meetingIdMatch[1];
       let pwd = '';
-      if (url.includes('pwd=')) {
-        const urlObj = new URL(url.startsWith('http') ? url : `https://${url}`);
-        pwd = urlObj.searchParams.get('pwd') || '';
+      const pwdMatch = url.match(/[?&]pwd=([^&]+)/);
+      if (pwdMatch && pwdMatch[1]) {
+        pwd = pwdMatch[1];
       }
       return `https://zoom.us/wc/join/${meetingId}${pwd ? '?pwd=' + pwd : ''}`;
     }
@@ -121,7 +122,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: GESTIÓN DE ZOOM CON CONFIRMACIÓN DE RESPUESTA
+// REST API: GESTIÓN DE ZOOM
 app.get('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
@@ -429,7 +430,7 @@ app.post('/api/super/assemblies', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.4' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.5' }));
 
 // CANAL WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -592,4 +593,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.4 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.5 corriendo en puerto ${PORT}`));
