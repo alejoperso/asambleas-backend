@@ -19,12 +19,12 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// HELPER: DETECTOR Y PROCESADOR MULTI-STREAMING (ZOOM / YOUTUBE LIVE / VIMEO / RTMP)
+// HELPER: PROCESADOR Y EXTRACTOR EXACTO DE CLAVE ZOOM Y TRANSMISIONES
 function processMediaStreamUrl(rawUrl, manualPasscode) {
   if (!rawUrl || typeof rawUrl !== 'string') return { type: 'none', url: '', passcode: '' };
   let url = rawUrl.trim();
 
-  // 1. Detección de YouTube Live / Video
+  // 1. Detección de YouTube Live
   const ytMatch = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/);
   if (ytMatch && ytMatch[1]) {
     return {
@@ -34,17 +34,7 @@ function processMediaStreamUrl(rawUrl, manualPasscode) {
     };
   }
 
-  // 2. Detección de Vimeo Live / Video
-  const vimeoMatch = url.match(/vimeo\.com\/(?:video\/)?(\d+)/);
-  if (vimeoMatch && vimeoMatch[1]) {
-    return {
-      type: 'vimeo',
-      url: `https://player.vimeo.com/video/${vimeoMatch[1]}?autoplay=1`,
-      passcode: ''
-    };
-  }
-
-  // 3. Detección y Formateo de Zoom
+  // 2. Detección y Formateo Preciso de Zoom (Sin doble codificación)
   try {
     const meetingIdMatch = url.match(/\/(?:j|wc|embed|join)\/(\d+)/) || url.match(/(\d{9,11})/);
     if (meetingIdMatch && meetingIdMatch[1]) {
@@ -52,19 +42,21 @@ function processMediaStreamUrl(rawUrl, manualPasscode) {
       let pwd = (manualPasscode || '').trim();
 
       if (!pwd) {
-        const pwdMatch = url.match(/[?&]pwd=([^&]+)/);
-        if (pwdMatch && pwdMatch[1]) pwd = decodeURIComponent(pwdMatch[1]);
+        const matchPwd = url.match(/[?&]pwd=([^&]+)/);
+        if (matchPwd && matchPwd[1]) {
+          pwd = matchPwd[1]; // Mantiene intacta la clave hash original de Zoom
+        }
       }
 
       return {
         type: 'zoom',
         meetingId: meetingId,
         passcode: pwd,
-        url: `https://zoom.us/wc/join/${meetingId}${pwd ? '?pwd=' + encodeURIComponent(pwd) : ''}`
+        url: `https://zoom.us/wc/join/${meetingId}${pwd ? '?pwd=' + pwd : ''}`
       };
     }
   } catch (err) {
-    console.error('Error al procesar URL:', err);
+    console.error('Error al procesar URL de Zoom:', err);
   }
 
   return { type: 'generic', url: url, passcode: manualPasscode || '' };
@@ -149,7 +141,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: GESTIÓN DE TRANSMISIÓN DE VIDEO Y ZOOM
+// REST API: GESTIÓN DE ZOOM Y TRANSMISIONES
 app.get('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
@@ -181,7 +173,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
 
     res.json({ 
       ok: true, 
-      message: 'Transmisión actualizada e integrada correctamente.', 
+      message: 'Transmisión procesada y actualizada correctamente.', 
       zoomEmbedUrl: streamData.url,
       streamInfo: streamData
     });
@@ -469,7 +461,7 @@ app.post('/api/super/assemblies', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.7' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.8' }));
 
 // CANAL WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -632,4 +624,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.7 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.8 corriendo en puerto ${PORT}`));
