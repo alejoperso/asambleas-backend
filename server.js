@@ -20,27 +20,23 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// HELPER: EXTRAER ID Y CLAVE
+// HELPER: EXTRAER ID Y CLAVE REAL
 function parseZoomCredentials(rawUrl, manualPasscode) {
   if (!rawUrl || typeof rawUrl !== 'string') return { meetingId: '', passcode: '' };
   const url = rawUrl.trim();
   const meetingIdMatch = url.match(/\/(?:j|wc|embed|join)\/(\d+)/) || url.match(/(\d{9,11})/);
   const meetingId = meetingIdMatch ? meetingIdMatch[1] : url.replace(/\D/g, '');
   
-  let pwd = (manualPasscode || '').trim();
-  if (!pwd) {
-    const matchPwd = url.match(/[?&]pwd=([^&]+)/);
-    if (matchPwd && matchPwd[1]) pwd = decodeURIComponent(matchPwd[1]);
-  }
-  return { meetingId, passcode: pwd };
+  // El SDK exige la contraseña real de la reunión, NO el hash encriptado pwd de la URL
+  const passcode = (manualPasscode || '').trim();
+  return { meetingId, passcode };
 }
 
-// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM (CON FALLBACK DIRECTO)
+// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
     
-    // Asignación directa como respaldo si las variables de entorno de Render no están cargadas
     const sdkKey = process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w';
     const sdkSecret = process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6';
 
@@ -408,7 +404,7 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.1-sdk' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.2-sdk' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -570,4 +566,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.1-sdk corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.2-sdk corriendo en puerto ${PORT}`));
