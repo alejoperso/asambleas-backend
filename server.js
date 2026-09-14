@@ -19,23 +19,40 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-async function getUserEffectiveCoefficient(userId, assemblyId) {
+// Helper: Coeficiente Efectivo + Lista de Representados
+async function getUserPowerDetails(userId, assemblyId) {
   try {
     const [rows] = await db.query(
-      `SELECT u.coeficiente,
-         COALESCE(SUM(u_ot.coeficiente), 0) AS coef_poderes
-       FROM usuarios u
-       LEFT JOIN poderes p ON p.apoderado_id = u.id AND p.assembly_id = ? AND p.estado = 'autorizado'
-       LEFT JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
-       WHERE u.id = ? AND u.assembly_id = ?
-       GROUP BY u.id`,
-      [assemblyId, userId, assemblyId]
+      `SELECT p.id AS poder_id, u_ot.identificador_unico, u_ot.nombre_completo, u_ot.unidad, u_ot.coeficiente
+       FROM poderes p
+       JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
+       WHERE p.apoderado_id = ? AND p.assembly_id = ? AND p.estado = 'autorizado'`,
+      [userId, assemblyId]
     );
-    if (rows.length === 0) return 0.00000;
-    return (parseFloat(rows[0].coeficiente) || 0) + (parseFloat(rows[0].coef_poderes) || 0);
+
+    let coefPoderes = 0;
+    const representados = rows.map(r => {
+      const c = parseFloat(r.coeficiente) || 0;
+      coefPoderes += c;
+      return {
+        identificador: r.identificador_unico,
+        nombre: r.nombre_completo,
+        unidad: r.unidad,
+        coeficiente: c
+      };
+    });
+
+    return { coefPoderes, representados };
   } catch (err) {
-    return 0.00000;
+    return { coefPoderes: 0, representados: [] };
   }
+}
+
+async function getUserEffectiveCoefficient(userId, assemblyId) {
+  const [u] = await db.query(`SELECT coeficiente FROM usuarios WHERE id = ?`, [userId]);
+  const propio = u.length > 0 ? parseFloat(u[0].coeficiente) || 0 : 0;
+  const { coefPoderes } = await getUserPowerDetails(userId, assemblyId);
+  return propio + coefPoderes;
 }
 
 async function updateAndBroadcastQuorum(assemblyId) {
@@ -81,7 +98,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: PREGUNTAS
+// REST API
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -91,9 +108,7 @@ app.get('/api/questions/:assemblyId', async (req, res) => {
       p.opciones = opciones;
     }
     res.json({ ok: true, preguntas });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.post('/api/questions', async (req, res) => {
@@ -109,18 +124,14 @@ app.post('/api/questions', async (req, res) => {
     }
     io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
     res.json({ ok: true, preguntaId });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// EDITAR PREGUNTA
 app.put('/api/questions/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { textoPregunta, duracionSegundos, opciones, assemblyId } = req.body;
     await db.query(`UPDATE preguntas SET texto_pregunta = ?, duracion_segundos = ? WHERE id = ?`, [textoPregunta, parseInt(duracionSegundos) || 60, id]);
-    
     if (opciones && opciones.length >= 2) {
       await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id = ?`, [id]);
       for (let i = 0; i < opciones.length; i++) {
@@ -128,13 +139,10 @@ app.put('/api/questions/:id', async (req, res) => {
       }
     }
     io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
-    res.json({ ok: true, message: 'Pregunta actualizada.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// ELIMINAR PREGUNTA DE FORMA SEGURA
 app.delete('/api/questions/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -143,10 +151,8 @@ app.delete('/api/questions/:id', async (req, res) => {
     await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id = ?`, [id]);
     await db.query(`DELETE FROM preguntas WHERE id = ?`, [id]);
     io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
-    res.json({ ok: true, message: 'Pregunta eliminada.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.post('/api/questions/:id/reset', async (req, res) => {
@@ -157,12 +163,9 @@ app.post('/api/questions/:id/reset', async (req, res) => {
     await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE id = ?`, [id]);
     io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
     res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// BUSCADOR DE USUARIOS PARA ADMINISTRACIÓN DE PODERES
 app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -178,27 +181,45 @@ app.get('/api/users/:assemblyId', async (req, res) => {
     sql += ` ORDER BY unidad ASC LIMIT 50`;
     const [usuarios] = await db.query(sql, params);
     res.json({ ok: true, usuarios });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// ASIGNACIÓN DIRECTA O ELIMINACIÓN DE PODER POR PARTE DEL ADMIN
+// CREAR APODERADO EXTERNO SI NO EXISTE Y ASIGNAR PODER
 app.post('/api/powers/manual', async (req, res) => {
   try {
-    const { assemblyId, otorganteId, apoderadoId } = req.body;
+    const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
+    const targetAssembly = assemblyId || 1;
+    const targetApoderadoId = apoderadoIdentificador.toString().trim().toUpperCase();
+
+    // Buscar o auto-crear apoderado externo
+    let [apoderadoRows] = await db.query(
+      `SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
+      [targetAssembly, targetApoderadoId]
+    );
+
+    let apoderadoNumId;
+    if (apoderadoRows.length === 0) {
+      const [ins] = await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
+         VALUES (?, ?, ?, 'Apoderado Externo', 0.00000, 'asistente')`,
+        [targetAssembly, targetApoderadoId, apoderadoNombre || 'Apoderado Externo']
+      );
+      apoderadoNumId = ins.insertId;
+    } else {
+      apoderadoNumId = apoderadoRows[0].id;
+    }
+
     await db.query(
       `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado, observaciones)
-       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMINISTRADOR', 'autorizado', 'Asignado manualmente desde consola admin')
+       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMIN', 'autorizado', 'Asignado manualmente')
        ON DUPLICATE KEY UPDATE apoderado_id = VALUES(apoderado_id), estado = 'autorizado'`,
-      [assemblyId || 1, otorganteId, apoderadoId]
+      [targetAssembly, otorganteId, apoderadoNumId]
     );
-    await updateAndBroadcastQuorum(assemblyId || 1);
-    io.to(`assembly_${assemblyId || 1}`).emit('powers:updated');
-    res.json({ ok: true, message: 'Poder asignado manualmente.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+
+    await updateAndBroadcastQuorum(targetAssembly);
+    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
+    res.json({ ok: true, message: 'Poder asignado correctamente.' });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.delete('/api/powers/:id', async (req, res) => {
@@ -210,10 +231,8 @@ app.delete('/api/powers/:id', async (req, res) => {
       await updateAndBroadcastQuorum(p[0].assembly_id);
       io.to(`assembly_${p[0].assembly_id}`).emit('powers:updated');
     }
-    res.json({ ok: true, message: 'Poder eliminado.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.get('/api/powers/:assemblyId', async (req, res) => {
@@ -231,9 +250,7 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
       [assemblyId]
     );
     res.json({ ok: true, poderes });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.post('/api/powers', async (req, res) => {
@@ -251,9 +268,7 @@ app.post('/api/powers', async (req, res) => {
     );
     io.to(`assembly_${assemblyId || 1}`).emit('powers:updated');
     res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.put('/api/powers/:powerId/status', async (req, res) => {
@@ -267,44 +282,10 @@ app.put('/api/powers/:powerId/status', async (req, res) => {
       io.to(`assembly_${p[0].assembly_id}`).emit('powers:updated');
     }
     res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// SUPER ADMINISTRADOR: ASAMBLEAS
-app.get('/api/super/assemblies', async (req, res) => {
-  try {
-    const [asambleas] = await db.query(`SELECT * FROM asambleas ORDER BY id DESC`);
-    res.json({ ok: true, asambleas });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.post('/api/super/assemblies', async (req, res) => {
-  try {
-    const { nombreCopropiedad, fechaEvento, adminId, adminNombre } = req.body;
-    const [resAsamblea] = await db.query(
-      `INSERT INTO asambleas (nombre_copropiedad, fecha_evento, estado) VALUES (?, ?, 'en_vivo')`,
-      [nombreCopropiedad, fechaEvento || new Date()]
-    );
-    const newAssemblyId = resAsamblea.insertId;
-
-    if (adminId) {
-      await db.query(
-        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
-         VALUES (?, ?, ?, 'Administración', 0.00000, 'administrador')`,
-        [newAssemblyId, adminId.toUpperCase(), adminNombre || 'Administrador Asignado']
-      );
-    }
-    res.json({ ok: true, assemblyId: newAssemblyId, message: 'Asamblea creada con éxito.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.5.0' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.6.0' }));
 
 // WEBSOCKETS
 io.on('connection', (socket) => {
@@ -343,20 +324,21 @@ io.on('connection', (socket) => {
       const roomName = `assembly_${targetAssembly}`;
       socket.join(roomName);
 
-      user.coeficienteEfectivo = await getUserEffectiveCoefficient(userId, targetAssembly);
-      socket.emit('auth:success', { user, room: roomName });
+      // Cargar Poderes Representados y Coeficientes
+      const { coefPoderes, representados } = await getUserPowerDetails(userId, targetAssembly);
+      user.coeficientePropio = parseFloat(user.coeficiente) || 0;
+      user.coeficienteEfectivo = user.coeficientePropio + coefPoderes;
+      user.poderesRepresentados = representados;
 
+      socket.emit('auth:success', { user, room: roomName });
       await updateAndBroadcastQuorum(targetAssembly);
 
-      // RESTAURACIÓN DE VOTACIÓN EN CURSO AL REFRESCAR LA PÁGINA
       if (activeQuestions.has(targetAssembly)) {
         const activeQ = activeQuestions.get(targetAssembly);
         const [votoUsuario] = await db.query(`SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`, [activeQ.id, userId]);
         socket.emit('voting:current_state', { ...activeQ, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
       }
-    } catch (error) {
-      socket.emit('auth:error', 'Error interno al autenticar.');
-    }
+    } catch (error) { socket.emit('auth:error', 'Error interno al autenticar.'); }
   });
 
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
@@ -399,9 +381,7 @@ io.on('connection', (socket) => {
       }, 1000);
 
       timerIntervals.set(assemblyId, interval);
-    } catch (error) {
-      console.error('Error al iniciar votación:', error);
-    }
+    } catch (error) { console.error(error); }
   });
 
   socket.on('admin:stop_voting', async ({ assemblyId, preguntaId }) => {
@@ -419,9 +399,7 @@ io.on('connection', (socket) => {
       const roomName = `assembly_${assemblyId}`;
       io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults });
       io.to(roomName).emit('questions:updated');
-    } catch (error) {
-      console.error('Error al detener votación:', error);
-    }
+    } catch (error) { console.error(error); }
   });
 
   socket.on('vote:submit', async ({ opcionId }) => {
@@ -442,9 +420,7 @@ io.on('connection', (socket) => {
       socket.emit('vote:confirmed', { opcionId });
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
       io.to(`assembly_${assemblyId}`).emit('voting:results_update', { resultados: updatedResults });
-    } catch (error) {
-      console.error('Error al registrar voto:', error);
-    }
+    } catch (error) { console.error(error); }
   });
 
   socket.on('disconnect', () => {
@@ -465,4 +441,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.5.0 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.6.0 corriendo en puerto ${PORT}`));
