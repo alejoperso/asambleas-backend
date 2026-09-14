@@ -35,15 +35,17 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
   return { meetingId, passcode: pwd };
 }
 
-// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM
+// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM (CON FALLBACK DIRECTO)
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
-    const sdkKey = process.env.ZOOM_SDK_KEY;
-    const sdkSecret = process.env.ZOOM_SDK_SECRET;
+    
+    // Asignación directa como respaldo si las variables de entorno de Render no están cargadas
+    const sdkKey = process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w';
+    const sdkSecret = process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6';
 
     if (!sdkKey || !sdkSecret) {
-      return res.status(500).json({ ok: false, error: 'Faltan credenciales ZOOM_SDK_KEY o ZOOM_SDK_SECRET en el .env' });
+      return res.status(500).json({ ok: false, error: 'Faltan credenciales de Zoom SDK.' });
     }
 
     const cleanMeetingNumber = (meetingNumber || '').toString().replace(/\D/g, '');
@@ -406,7 +408,7 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.0-sdk' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.1-sdk' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -568,4 +570,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.0-sdk corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.1-sdk corriendo en puerto ${PORT}`));
