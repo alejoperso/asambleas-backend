@@ -30,7 +30,7 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
   return { meetingId, passcode };
 }
 
-// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM (ESTRUCTURA CORREGIDA)
+// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
@@ -52,11 +52,10 @@ app.post('/api/zoom/signature', (req, res) => {
 
     const oHeader = { alg: 'HS256', typ: 'JWT' };
     
-    // ESTRUCTURA ESTÁNDAR EXIGIDA POR ZOOM MEETING SDK
     const oPayload = {
       sdkKey: sdkKey,
       appKey: sdkKey,
-      mn: cleanMn, // Debe ser un Integer
+      mn: cleanMn,
       role: parseInt(role || 0, 10),
       iat: iat,
       exp: exp,
@@ -409,7 +408,7 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.3-sdk' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.4-sdk' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -571,4 +570,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.3-sdk corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.4-sdk corriendo en puerto ${PORT}`));
