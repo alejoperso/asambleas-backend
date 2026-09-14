@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -20,8 +19,8 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// HELPER: CONVERTIDOR Y EXTRACTOR DE CONTRASEÑA ZOOM (/wc/join/)
-function formatZoomEmbedUrl(rawUrl) {
+// HELPER: CONVERTIDOR AUTOMÁTICO CON EXTRACCIÓN AVANZADA DE PASSCODE Y RUTA /wc/join/
+function formatZoomEmbedUrl(rawUrl, manualPasscode) {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
   let url = rawUrl.trim();
 
@@ -29,12 +28,16 @@ function formatZoomEmbedUrl(rawUrl) {
     const meetingIdMatch = url.match(/\/(?:j|wc|embed|join)\/(\d+)/) || url.match(/(\d{9,11})/);
     if (meetingIdMatch && meetingIdMatch[1]) {
       const meetingId = meetingIdMatch[1];
-      let pwd = '';
-      const pwdMatch = url.match(/[?&]pwd=([^&]+)/);
-      if (pwdMatch && pwdMatch[1]) {
-        pwd = pwdMatch[1];
+      let pwd = (manualPasscode || '').trim();
+
+      if (!pwd) {
+        const pwdMatch = url.match(/[?&]pwd=([^&]+)/);
+        if (pwdMatch && pwdMatch[1]) {
+          pwd = pwdMatch[1];
+        }
       }
-      return `https://zoom.us/wc/join/${meetingId}${pwd ? '?pwd=' + pwd : ''}`;
+
+      return `https://zoom.us/wc/join/${meetingId}${pwd ? '?pwd=' + encodeURIComponent(pwd) : ''}`;
     }
   } catch (err) {
     console.error('Error al procesar URL de Zoom:', err);
@@ -137,12 +140,12 @@ app.get('/api/assemblies/:id/zoom', async (req, res) => {
 app.put('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
-    const { zoomEmbedUrl, zoomMeetingId, zoomPasscode } = req.body;
-    const formattedUrl = formatZoomEmbedUrl(zoomEmbedUrl);
+    const { zoomEmbedUrl, zoomPasscode } = req.body;
+    const formattedUrl = formatZoomEmbedUrl(zoomEmbedUrl, zoomPasscode);
 
     await db.query(
-      `UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`,
-      [formattedUrl, zoomMeetingId || '', zoomPasscode || '', id]
+      `UPDATE asambleas SET zoom_embed_url = ?, zoom_passcode = ? WHERE id = ?`,
+      [formattedUrl, zoomPasscode || '', id]
     );
     io.to(`assembly_${id}`).emit('zoom:updated', { zoomEmbedUrl: formattedUrl });
     res.json({ ok: true, message: 'Enlace de Zoom procesado y guardado correctamente.', zoomEmbedUrl: formattedUrl });
@@ -430,7 +433,7 @@ app.post('/api/super/assemblies', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.5' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.6' }));
 
 // CANAL WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -593,4 +596,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.5 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.6 corriendo en puerto ${PORT}`));
