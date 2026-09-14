@@ -20,36 +20,35 @@ const io = new Server(server, {
 
 const activeQuestions = new Map();
 const timerIntervals = new Map();
-const activeSessions = new Map();
 
-// Helper: Calcular quórum de usuarios conectados en la asamblea
+// CONTROL DE SESIONES Y PERIODO DE GRACIA EXTENDIDO
+const activeSessions = new Map(); // Map<sessionKey, { userId, assemblyId, socketId }>
+const disconnectTimeouts = new Map(); // Map<sessionKey, timeoutId>
+
+// PERIODO DE GRACIA: 10 Minutos de tolerancia para pantallas bloqueadas / debates largos
+const GRACE_PERIOD_MS = 10 * 60 * 1000; 
+
+// Helper: Calcular quórum basado en SESIONES ACTIVAS (mantiene quórum con pantalla bloqueada)
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
-    const room = io.sockets.adapter.rooms.get(`assembly_${assemblyId}`);
-    if (!room) {
-      io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage: 0 });
-      return;
-    }
+    const activeUserIds = [];
 
-    const connectedSocketIds = Array.from(room);
-    const userIds = [];
-
-    connectedSocketIds.forEach(socketId => {
-      const sock = io.sockets.sockets.get(socketId);
-      if (sock && sock.userId) {
-        userIds.push(sock.userId);
+    // Extraer todos los usuarios que están activos o en periodo de gracia
+    for (const [key, session] of activeSessions.entries()) {
+      if (session.assemblyId === parseInt(assemblyId)) {
+        activeUserIds.push(session.userId);
       }
-    });
+    }
 
-    if (userIds.length === 0) {
-      io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage: 0 });
+    if (activeUserIds.length === 0) {
+      io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage: "0.0000" });
       return;
     }
 
-    // Sumar coeficientes de usuarios conectados
+    // Consultar suma de coeficientes en BD
     const [rows] = await db.query(
       `SELECT SUM(coeficiente) AS total_quorum FROM usuarios WHERE id IN (?) AND assembly_id = ?`,
-      [userIds, assemblyId]
+      [activeUserIds, assemblyId]
     );
 
     const totalQuorum = rows[0].total_quorum ? parseFloat(rows[0].total_quorum) : 0;
@@ -96,7 +95,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// API: Obtener preguntas disponibles para el panel admin
+// API: Obtener preguntas para el panel admin
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -119,13 +118,19 @@ app.get('/api/questions/:assemblyId', async (req, res) => {
   }
 });
 
+// ROUTE DE PRUEBA HTTP
+app.get('/', (req, res) => {
+  res.json({ status: 'online', system: 'Plataforma Multi-tenant de Asambleas', version: '1.2.0' });
+});
+
 // WEBSOCKETS
 io.on('connection', (socket) => {
   console.log(`🔌 Cliente conectado: ${socket.id}`);
 
+  // 1. UNIRSE CON TOLERANCIA Y MANTENIMIENTO DE QUÓRUM
   socket.on('auth:join', async ({ assemblyId, identificadorUnico }) => {
     try {
-      const targetAssembly = assemblyId || 1;
+      const targetAssembly = parseInt(assemblyId) || 1;
       const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
 
       const [rows] = await db.query(
@@ -143,14 +148,29 @@ io.on('connection', (socket) => {
       const userId = user.id;
       const sessionKey = `${targetAssembly}_${userId}`;
 
-      if (activeSessions.has(sessionKey)) {
-        const previousSocketId = activeSessions.get(sessionKey);
-        io.to(previousSocketId).emit('session:invalidated', {
-          message: 'Se ha iniciado sesión con este usuario desde otro dispositivo.'
-        });
+      // SI EL USUARIO VOLVIÓ A CONECTARSE DENTRO DE LOS 10 MINUTOS: CANCELAR CUENTA REGRESIVA
+      if (disconnectTimeouts.has(sessionKey)) {
+        clearTimeout(disconnectTimeouts.get(sessionKey));
+        disconnectTimeouts.delete(sessionKey);
+        console.log(`🔄 Pantalla desbloqueada / Reconexión dentro de los 10m para: ${sessionKey}`);
+      } 
+      // CONTROL DE SESIÓN ÚNICA: Si entra desde OTRO dispositivo físico, cerrar la sesión previa
+      else if (activeSessions.has(sessionKey)) {
+        const existingSession = activeSessions.get(sessionKey);
+        if (existingSession.socketId !== socket.id) {
+          io.to(existingSession.socketId).emit('session:invalidated', {
+            message: 'Se ha iniciado sesión con este usuario desde otro dispositivo.'
+          });
+        }
       }
 
-      activeSessions.set(sessionKey, socket.id);
+      // Registrar/Actualizar sesión activa
+      activeSessions.set(sessionKey, {
+        userId,
+        assemblyId: targetAssembly,
+        socketId: socket.id
+      });
+
       socket.sessionKey = sessionKey;
       socket.assemblyId = targetAssembly;
       socket.userId = userId;
@@ -165,6 +185,7 @@ io.on('connection', (socket) => {
       // Actualizar Quórum global
       await updateAndBroadcastQuorum(targetAssembly);
 
+      // Entregar estado actual de la votación si está corriendo
       if (activeQuestions.has(targetAssembly)) {
         const activeQ = activeQuestions.get(targetAssembly);
         const [votoUsuario] = await db.query(
@@ -277,11 +298,28 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('disconnect', async () => {
-    if (socket.sessionKey && activeSessions.get(socket.sessionKey) === socket.id) {
-      activeSessions.delete(socket.sessionKey);
-      if (socket.assemblyId) {
-        await updateAndBroadcastQuorum(socket.assemblyId);
+  // DESCONEXIÓN POR PANTALLA BLOQUEADA (ESPERA 10 MINUTOS ANTES DE BAJAR EL QUÓRUM)
+  socket.on('disconnect', () => {
+    if (socket.sessionKey && activeSessions.has(socket.sessionKey)) {
+      const sessionKey = socket.sessionKey;
+      const sessionData = activeSessions.get(socket.sessionKey);
+
+      if (sessionData.socketId === socket.id) {
+        if (disconnectTimeouts.has(sessionKey)) {
+          clearTimeout(disconnectTimeouts.get(sessionKey));
+        }
+
+        console.log(`⏳ Pantalla bloqueada / Suspensión de red. Esperando 10 minutos para: ${sessionKey}`);
+
+        // PROGRAMAR TEMPORIZADOR DE 10 MINUTOS
+        const timeoutId = setTimeout(async () => {
+          activeSessions.delete(sessionKey);
+          disconnectTimeouts.delete(sessionKey);
+          await updateAndBroadcastQuorum(sessionData.assemblyId);
+          console.log(`❌ Sesión expirada tras 10 minutos de inactividad: ${sessionKey}`);
+        }, GRACE_PERIOD_MS);
+
+        disconnectTimeouts.set(sessionKey, timeoutId);
       }
     }
   });
@@ -289,5 +327,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Servidor de Asambleas corriendo en puerto ${PORT}`);
+  console.log(`🚀 Servidor de Asambleas v1.2 corriendo en puerto ${PORT}`);
 });
