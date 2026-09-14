@@ -19,28 +19,26 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// HELPER: CONVERTIDOR AUTOMÁTICO DE ENLACES DE ZOOM A EMBED WEB
+// HELPER: CONVERTIDOR AUTOMÁTICO Y SANITIZADOR MULTI-DOMINIO DE ZOOM
 function formatZoomEmbedUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
   let url = rawUrl.trim();
 
-  if (url.includes('/wc/embed/') || url.includes('/wc/join')) {
-    return url;
-  }
+  if (url.includes('/wc/embed/')) return url;
 
   try {
-    const matchMeetingId = url.match(/\/(?:j|wc|embed)\/(\d+)/) || url.match(/(\d{9,11})/);
-    if (matchMeetingId && matchMeetingId[1]) {
-      const meetingId = matchMeetingId[1];
+    const meetingIdMatch = url.match(/\/(?:j|wc|embed)\/(\d+)/) || url.match(/(\d{9,11})/);
+    if (meetingIdMatch && meetingIdMatch[1]) {
+      const meetingId = meetingIdMatch[1];
       let pwd = '';
       if (url.includes('pwd=')) {
-        const parsedUrl = new URL(url.startsWith('http') ? url : `https://${url}`);
-        pwd = parsedUrl.searchParams.get('pwd') || '';
+        const urlObj = new URL(url.startsWith('http') ? url : `https://${url}`);
+        pwd = urlObj.searchParams.get('pwd') || '';
       }
       return `https://zoom.us/wc/embed/${meetingId}/join${pwd ? '?pwd=' + pwd : ''}`;
     }
   } catch (err) {
-    console.error('Error al formatear URL de Zoom:', err);
+    console.error('Error al procesar URL de Zoom:', err);
   }
 
   return url;
@@ -125,7 +123,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: GESTIÓN DE ZOOM CON CONVERSIÓN AUTOMÁTICA
+// REST API: GESTIÓN DE ZOOM CON CONFIRMACIÓN DE RESPUESTA
 app.get('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
@@ -148,7 +146,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
       [formattedUrl, zoomMeetingId || '', zoomPasscode || '', id]
     );
     io.to(`assembly_${id}`).emit('zoom:updated', { zoomEmbedUrl: formattedUrl });
-    res.json({ ok: true, message: 'Enlace de Zoom procesado y actualizado exitosamente.', zoomEmbedUrl: formattedUrl });
+    res.json({ ok: true, message: 'Enlace de Zoom procesado y guardado correctamente.', zoomEmbedUrl: formattedUrl });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -433,7 +431,7 @@ app.post('/api/super/assemblies', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.1' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.2' }));
 
 // CANAL WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -596,4 +594,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.1 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.2 corriendo en puerto ${PORT}`));
