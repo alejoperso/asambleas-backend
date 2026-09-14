@@ -19,11 +19,32 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// HELPER: CONVERTIDOR AUTOMÁTICO CON EXTRACCIÓN AVANZADA DE PASSCODE Y RUTA /wc/join/
-function formatZoomEmbedUrl(rawUrl, manualPasscode) {
-  if (!rawUrl || typeof rawUrl !== 'string') return '';
+// HELPER: DETECTOR Y PROCESADOR MULTI-STREAMING (ZOOM / YOUTUBE LIVE / VIMEO / RTMP)
+function processMediaStreamUrl(rawUrl, manualPasscode) {
+  if (!rawUrl || typeof rawUrl !== 'string') return { type: 'none', url: '', passcode: '' };
   let url = rawUrl.trim();
 
+  // 1. Detección de YouTube Live / Video
+  const ytMatch = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/);
+  if (ytMatch && ytMatch[1]) {
+    return {
+      type: 'youtube',
+      url: `https://www.youtube.com/embed/${ytMatch[1]}?autoplay=1&rel=0&modestbranding=1`,
+      passcode: ''
+    };
+  }
+
+  // 2. Detección de Vimeo Live / Video
+  const vimeoMatch = url.match(/vimeo\.com\/(?:video\/)?(\d+)/);
+  if (vimeoMatch && vimeoMatch[1]) {
+    return {
+      type: 'vimeo',
+      url: `https://player.vimeo.com/video/${vimeoMatch[1]}?autoplay=1`,
+      passcode: ''
+    };
+  }
+
+  // 3. Detección y Formateo de Zoom
   try {
     const meetingIdMatch = url.match(/\/(?:j|wc|embed|join)\/(\d+)/) || url.match(/(\d{9,11})/);
     if (meetingIdMatch && meetingIdMatch[1]) {
@@ -32,18 +53,21 @@ function formatZoomEmbedUrl(rawUrl, manualPasscode) {
 
       if (!pwd) {
         const pwdMatch = url.match(/[?&]pwd=([^&]+)/);
-        if (pwdMatch && pwdMatch[1]) {
-          pwd = pwdMatch[1];
-        }
+        if (pwdMatch && pwdMatch[1]) pwd = decodeURIComponent(pwdMatch[1]);
       }
 
-      return `https://zoom.us/wc/join/${meetingId}${pwd ? '?pwd=' + encodeURIComponent(pwd) : ''}`;
+      return {
+        type: 'zoom',
+        meetingId: meetingId,
+        passcode: pwd,
+        url: `https://zoom.us/wc/join/${meetingId}${pwd ? '?pwd=' + encodeURIComponent(pwd) : ''}`
+      };
     }
   } catch (err) {
-    console.error('Error al procesar URL de Zoom:', err);
+    console.error('Error al procesar URL:', err);
   }
 
-  return url;
+  return { type: 'generic', url: url, passcode: manualPasscode || '' };
 }
 
 // HELPER: CONSULTA DETALLADA DE PODERES Y COEFICIENTE EFECTIVO
@@ -125,13 +149,15 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: GESTIÓN DE ZOOM
+// REST API: GESTIÓN DE TRANSMISIÓN DE VIDEO Y ZOOM
 app.get('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
     const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
     if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
-    res.json({ ok: true, zoom: rows[0] });
+    
+    const streamInfo = processMediaStreamUrl(rows[0].zoom_embed_url, rows[0].zoom_passcode);
+    res.json({ ok: true, zoom: rows[0], streamInfo });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -141,14 +167,24 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
     const { zoomEmbedUrl, zoomPasscode } = req.body;
-    const formattedUrl = formatZoomEmbedUrl(zoomEmbedUrl, zoomPasscode);
+    const streamData = processMediaStreamUrl(zoomEmbedUrl, zoomPasscode);
 
     await db.query(
       `UPDATE asambleas SET zoom_embed_url = ?, zoom_passcode = ? WHERE id = ?`,
-      [formattedUrl, zoomPasscode || '', id]
+      [streamData.url, streamData.passcode || '', id]
     );
-    io.to(`assembly_${id}`).emit('zoom:updated', { zoomEmbedUrl: formattedUrl });
-    res.json({ ok: true, message: 'Enlace de Zoom procesado y guardado correctamente.', zoomEmbedUrl: formattedUrl });
+
+    io.to(`assembly_${id}`).emit('zoom:updated', { 
+      zoomEmbedUrl: streamData.url, 
+      streamInfo: streamData 
+    });
+
+    res.json({ 
+      ok: true, 
+      message: 'Transmisión actualizada e integrada correctamente.', 
+      zoomEmbedUrl: streamData.url,
+      streamInfo: streamData
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -433,7 +469,7 @@ app.post('/api/super/assemblies', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.6' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.7' }));
 
 // CANAL WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -596,4 +632,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.6 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.7 corriendo en puerto ${PORT}`));
