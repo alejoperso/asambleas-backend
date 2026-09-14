@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const db = require('./db');
 
@@ -19,51 +20,109 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// HELPER: PROCESADOR AUTOMÁTICO DE TRANSPARENCIA PARA ZOOM Y MEDIA
-function processMediaStreamUrl(rawUrl, manualPasscode) {
-  if (!rawUrl || typeof rawUrl !== 'string') return { type: 'none', url: '', passcode: '', meetingId: '' };
-  let url = rawUrl.trim();
-
-  // Detección de transmisión YouTube Live
-  const ytMatch = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/);
-  if (ytMatch && ytMatch[1]) {
-    return {
-      type: 'youtube',
-      url: `https://www.youtube.com/embed/${ytMatch[1]}?autoplay=1&rel=0&modestbranding=1`,
-      passcode: '',
-      meetingId: ''
-    };
+// HELPER: EXTRAER ID Y CLAVE
+function parseZoomCredentials(rawUrl, manualPasscode) {
+  if (!rawUrl || typeof rawUrl !== 'string') return { meetingId: '', passcode: '' };
+  const url = rawUrl.trim();
+  const meetingIdMatch = url.match(/\/(?:j|wc|embed|join)\/(\d+)/) || url.match(/(\d{9,11})/);
+  const meetingId = meetingIdMatch ? meetingIdMatch[1] : url.replace(/\D/g, '');
+  
+  let pwd = (manualPasscode || '').trim();
+  if (!pwd) {
+    const matchPwd = url.match(/[?&]pwd=([^&]+)/);
+    if (matchPwd && matchPwd[1]) pwd = decodeURIComponent(matchPwd[1]);
   }
-
-  // Detección y extracción de ID y Clave de Zoom
-  try {
-    const meetingIdMatch = url.match(/\/(?:j|wc|embed|join)\/(\d+)/) || url.match(/(\d{9,11})/);
-    if (meetingIdMatch && meetingIdMatch[1]) {
-      const meetingId = meetingIdMatch[1];
-      let pwd = (manualPasscode || '').trim();
-
-      if (!pwd) {
-        const matchPwd = url.match(/[?&]pwd=([^&]+)/);
-        if (matchPwd && matchPwd[1]) pwd = matchPwd[1];
-      }
-
-      const cleanEmbedUrl = `https://zoom.us/wc/join/${meetingId}?pwd=${encodeURIComponent(pwd)}`;
-
-      return {
-        type: 'zoom',
-        meetingId: meetingId,
-        passcode: pwd,
-        url: cleanEmbedUrl
-      };
-    }
-  } catch (err) {
-    console.error('Error procesando URL de Zoom:', err);
-  }
-
-  return { type: 'generic', url: url, passcode: manualPasscode || '', meetingId: '' };
+  return { meetingId, passcode: pwd };
 }
 
-// HELPER: CONSULTA DETALLADA DE PODERES Y COEFICIENTE EFECTIVO
+// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM
+app.post('/api/zoom/signature', (req, res) => {
+  try {
+    const { meetingNumber, role } = req.body;
+    const sdkKey = process.env.ZOOM_SDK_KEY;
+    const sdkSecret = process.env.ZOOM_SDK_SECRET;
+
+    if (!sdkKey || !sdkSecret) {
+      return res.status(500).json({ ok: false, error: 'Faltan credenciales ZOOM_SDK_KEY o ZOOM_SDK_SECRET en el .env' });
+    }
+
+    const cleanMeetingNumber = (meetingNumber || '').toString().replace(/\D/g, '');
+    const iat = Math.floor(Date.now() / 1000) - 30;
+    const exp = iat + 60 * 60 * 2; // Validez de 2 horas
+
+    const oHeader = { alg: 'HS256', typ: 'JWT' };
+    const oPayload = {
+      sdkKey: sdkKey,
+      mn: cleanMeetingNumber,
+      role: role || 0, // 0 = Asistente, 1 = Moderador
+      iat: iat,
+      exp: exp,
+      tokenExp: exp
+    };
+
+    const sHeader = Buffer.from(JSON.stringify(oHeader)).toString('base64url');
+    const sPayload = Buffer.from(JSON.stringify(oPayload)).toString('base64url');
+    const dataToSign = `${sHeader}.${sPayload}`;
+
+    const signature = crypto
+      .createHmac('sha256', sdkSecret)
+      .update(dataToSign)
+      .digest('base64url');
+
+    const jwtToken = `${dataToSign}.${signature}`;
+
+    res.json({ ok: true, signature: jwtToken, sdkKey });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: CONSULTA Y CONFIGURACIÓN DE TRANSMISIÓN DE ASAMBLEA
+app.get('/api/assemblies/:id/zoom', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
+    
+    const parsed = parseZoomCredentials(rows[0].zoom_embed_url, rows[0].zoom_passcode);
+    const meetingId = rows[0].zoom_meeting_id || parsed.meetingId;
+    const passcode = rows[0].zoom_passcode || parsed.passcode;
+
+    res.json({ 
+      ok: true, 
+      zoom: {
+        rawUrl: rows[0].zoom_embed_url,
+        meetingId: meetingId,
+        passcode: passcode
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.put('/api/assemblies/:id/zoom', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { zoomEmbedUrl, zoomPasscode } = req.body;
+    const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
+
+    await db.query(
+      `UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`,
+      [zoomEmbedUrl, parsed.meetingId, parsed.passcode, id]
+    );
+
+    const streamData = { meetingId: parsed.meetingId, passcode: parsed.passcode, rawUrl: zoomEmbedUrl };
+
+    io.to(`assembly_${id}`).emit('zoom:updated', { streamInfo: streamData });
+
+    res.json({ ok: true, message: 'Configuración guardada correctamente.', streamInfo: streamData });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// HELPER: PODERES Y COEFICIENTE
 async function getUserPowerDetails(userId, assemblyId) {
   try {
     const [rows] = await db.query(
@@ -78,12 +137,7 @@ async function getUserPowerDetails(userId, assemblyId) {
     const representados = rows.map(r => {
       const c = parseFloat(r.coeficiente) || 0;
       coefPoderes += c;
-      return {
-        identificador: r.identificador_unico,
-        nombre: r.nombre_completo,
-        unidad: r.unidad,
-        coeficiente: c
-      };
+      return { identificador: r.identificador_unico, nombre: r.nombre_completo, unidad: r.unidad, coeficiente: c };
     });
 
     return { coefPoderes, representados };
@@ -142,60 +196,12 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: GESTIÓN DE ZOOM Y TRANSMISIÓN
-app.get('/api/assemblies/:id/zoom', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
-    
-    const streamInfo = processMediaStreamUrl(rows[0].zoom_embed_url, rows[0].zoom_passcode);
-    res.json({ ok: true, zoom: rows[0], streamInfo });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.put('/api/assemblies/:id/zoom', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { zoomEmbedUrl, zoomPasscode } = req.body;
-    const streamData = processMediaStreamUrl(zoomEmbedUrl, zoomPasscode);
-
-    await db.query(
-      `UPDATE asambleas SET zoom_embed_url = ?, zoom_passcode = ? WHERE id = ?`,
-      [streamData.url, streamData.passcode || '', id]
-    );
-
-    io.to(`assembly_${id}`).emit('zoom:updated', { 
-      zoomEmbedUrl: streamData.url, 
-      streamInfo: streamData 
-    });
-
-    res.json({ 
-      ok: true, 
-      message: 'Transmisión configurada correctamente.', 
-      zoomEmbedUrl: streamData.url,
-      streamInfo: streamData
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// REST API: REPORTES EN EXCEL / CSV
+// REST API: EXCEL REPORTES
 app.get('/api/reports/assembly/:id/excel', async (req, res) => {
   try {
     const { id } = req.params;
     const [votos] = await db.query(
-      `SELECT 
-         p.texto_pregunta AS Pregunta,
-         u.identificador_unico AS ID_Votante,
-         u.nombre_completo AS Nombre,
-         u.unidad AS Unidad,
-         o.texto_opcion AS Opcion_Votada,
-         v.coeficiente_aplicado AS Coeficiente_Efectivo,
-         v.created_at AS Fecha_Hora_Voto
+      `SELECT p.texto_pregunta AS Pregunta, u.identificador_unico AS ID_Votante, u.nombre_completo AS Nombre, u.unidad AS Unidad, o.texto_opcion AS Opcion_Votada, v.coeficiente_aplicado AS Coeficiente_Efectivo, v.created_at AS Fecha_Hora_Voto
        FROM votos v
        JOIN preguntas p ON v.pregunta_id = p.id
        JOIN usuarios u ON v.usuario_id = u.id
@@ -286,20 +292,7 @@ app.delete('/api/questions/:id', async (req, res) => {
   }
 });
 
-app.post('/api/questions/:id/reset', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { assemblyId } = req.body;
-    await db.query(`DELETE FROM votos WHERE pregunta_id = ?`, [id]);
-    await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE id = ?`, [id]);
-    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// REST API: USUARIOS Y BUSCADOR
+// REST API: USUARIOS Y PODERES
 app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -320,7 +313,6 @@ app.get('/api/users/:assemblyId', async (req, res) => {
   }
 });
 
-// REST API: PODERES Y APODERADO EXTERNO
 app.post('/api/powers/manual', async (req, res) => {
   try {
     const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
@@ -414,57 +406,9 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.put('/api/powers/:powerId/status', async (req, res) => {
-  try {
-    const { powerId } = req.params;
-    const { estado, observaciones } = req.body;
-    await db.query(`UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`, [estado, observaciones || '', powerId]);
-    const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [powerId]);
-    if (p.length > 0) {
-      await updateAndBroadcastQuorum(p[0].assembly_id);
-      io.to(`assembly_${p[0].assembly_id}`).emit('powers:updated');
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.0-sdk' }));
 
-// SUPER ADMIN REST API
-app.get('/api/super/assemblies', async (req, res) => {
-  try {
-    const [asambleas] = await db.query(`SELECT * FROM asambleas ORDER BY id DESC`);
-    res.json({ ok: true, asambleas });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.post('/api/super/assemblies', async (req, res) => {
-  try {
-    const { nombreCopropiedad, fechaEvento, adminId, adminNombre } = req.body;
-    const [resAsamblea] = await db.query(
-      `INSERT INTO asambleas (nombre_copropiedad, fecha_evento, estado) VALUES (?, ?, 'en_vivo')`,
-      [nombreCopropiedad, fechaEvento || new Date()]
-    );
-    const newAssemblyId = resAsamblea.insertId;
-
-    if (adminId) {
-      await db.query(
-        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
-         VALUES (?, ?, ?, 'Administración', 0.00000, 'administrador')`,
-        [newAssemblyId, adminId.toUpperCase(), adminNombre || 'Administrador Asignado']
-      );
-    }
-    res.json({ ok: true, assemblyId: newAssemblyId, message: 'Asamblea creada con éxito.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.7.9' }));
-
-// CANAL WEBSOCKETS EN TIEMPO REAL
+// WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
   socket.on('auth:join', async ({ assemblyId, identificadorUnico }) => {
     try {
@@ -472,8 +416,7 @@ io.on('connection', (socket) => {
       const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
 
       const [rows] = await db.query(
-        `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol 
-         FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
+        `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
         [targetAssembly, targetId]
       );
 
@@ -625,4 +568,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.7.9 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.0-sdk corriendo en puerto ${PORT}`));
