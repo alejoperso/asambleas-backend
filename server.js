@@ -26,13 +26,11 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
   const url = rawUrl.trim();
   const meetingIdMatch = url.match(/\/(?:j|wc|embed|join)\/(\d+)/) || url.match(/(\d{9,11})/);
   const meetingId = meetingIdMatch ? meetingIdMatch[1] : url.replace(/\D/g, '');
-  
-  // El SDK exige la contraseña real de la reunión, NO el hash encriptado pwd de la URL
   const passcode = (manualPasscode || '').trim();
   return { meetingId, passcode };
 }
 
-// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM
+// REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM (ESTRUCTURA CORREGIDA)
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
@@ -44,15 +42,22 @@ app.post('/api/zoom/signature', (req, res) => {
       return res.status(500).json({ ok: false, error: 'Faltan credenciales de Zoom SDK.' });
     }
 
-    const cleanMeetingNumber = (meetingNumber || '').toString().replace(/\D/g, '');
+    const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
+    if (!cleanMn || isNaN(cleanMn)) {
+      return res.status(400).json({ ok: false, error: 'ID de reunión de Zoom inválido.' });
+    }
+
     const iat = Math.floor(Date.now() / 1000) - 30;
     const exp = iat + 60 * 60 * 2; // Validez de 2 horas
 
     const oHeader = { alg: 'HS256', typ: 'JWT' };
+    
+    // ESTRUCTURA ESTÁNDAR EXIGIDA POR ZOOM MEETING SDK
     const oPayload = {
       sdkKey: sdkKey,
-      mn: cleanMeetingNumber,
-      role: role || 0, // 0 = Asistente, 1 = Moderador
+      appKey: sdkKey,
+      mn: cleanMn, // Debe ser un Integer
+      role: parseInt(role || 0, 10),
       iat: iat,
       exp: exp,
       tokenExp: exp
@@ -404,7 +409,7 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.2-sdk' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.3-sdk' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -566,4 +571,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.2-sdk corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.3-sdk corriendo en puerto ${PORT}`));
