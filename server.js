@@ -7,26 +7,22 @@ const db = require('./db');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// SOPORTE PARA CARGA DE IMÁGENES Y PDFS EN BASE64
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
 const activeQuestions = new Map();
 const timerIntervals = new Map();
-
-// CONTROL DE SESIONES Y PERIODO DE GRACIA (10 MINUTOS)
 const activeSessions = new Map(); 
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
-// Helper: Calcular Coeficiente Efectivo del Usuario (Propio + Poderes Autorizados)
 async function getUserEffectiveCoefficient(userId, assemblyId) {
   try {
     const [rows] = await db.query(
@@ -41,21 +37,16 @@ async function getUserEffectiveCoefficient(userId, assemblyId) {
     );
 
     if (rows.length === 0) return 0.00000;
-    
-    const propio = parseFloat(rows[0].coeficiente) || 0;
-    const poderes = parseFloat(rows[0].coef_poderes) || 0;
-    return propio + poderes;
+    return (parseFloat(rows[0].coeficiente) || 0) + (parseFloat(rows[0].coef_poderes) || 0);
   } catch (err) {
     console.error('Error calculando coeficiente efectivo:', err);
     return 0.00000;
   }
 }
 
-// Helper: Calcular quórum de usuarios conectados
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
     const activeUserIds = [];
-
     for (const [key, session] of activeSessions.entries()) {
       if (session.assemblyId === parseInt(assemblyId)) {
         activeUserIds.push(session.userId);
@@ -79,7 +70,6 @@ async function updateAndBroadcastQuorum(assemblyId) {
   }
 }
 
-// Helper: Resultados ponderados por coeficiente
 async function calculateWeightedResults(assemblyId, preguntaId) {
   const [votos] = await db.query(
     `SELECT v.opcion_id, v.coeficiente_aplicado 
@@ -113,7 +103,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// API: Obtener preguntas para el panel admin
+// REST API
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -136,11 +126,9 @@ app.get('/api/questions/:assemblyId', async (req, res) => {
   }
 });
 
-// API: CREAR NUEVA PREGUNTA DESDE ADMIN
 app.post('/api/questions', async (req, res) => {
   try {
     const { assemblyId, textoPregunta, duracionSegundos, opciones } = req.body;
-
     if (!textoPregunta || !opciones || opciones.length < 2) {
       return res.status(400).json({ ok: false, error: 'Debes proporcionar una pregunta y al menos 2 opciones.' });
     }
@@ -151,7 +139,6 @@ app.post('/api/questions', async (req, res) => {
     );
 
     const preguntaId = result.insertId;
-
     for (let i = 0; i < opciones.length; i++) {
       await db.query(
         `INSERT INTO opciones_pregunta (pregunta_id, texto_opcion, orden) VALUES (?, ?, ?)`,
@@ -161,12 +148,27 @@ app.post('/api/questions', async (req, res) => {
 
     res.json({ ok: true, preguntaId, message: 'Pregunta creada exitosamente.' });
   } catch (err) {
-    console.error('Error al crear pregunta:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// API: OBTENER PODERES REGISTRADOS
+// REINICIAR VOTACIÓN (BORRAR VOTOS REGISTRADOS Y RESTAURAR ESTADO)
+app.post('/api/questions/:id/reset', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { assemblyId } = req.body;
+    const targetAssembly = assemblyId || 1;
+
+    await db.query(`DELETE FROM votos WHERE pregunta_id = ? AND assembly_id = ?`, [id, targetAssembly]);
+    await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE id = ? AND assembly_id = ?`, [id, targetAssembly]);
+
+    io.to(`assembly_${targetAssembly}`).emit('questions:updated');
+    res.json({ ok: true, message: 'Votación reiniciada exitosamente.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get('/api/powers/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -181,14 +183,12 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
        ORDER BY p.created_at DESC`,
       [assemblyId]
     );
-
     res.json({ ok: true, poderes });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// API: REGISTRAR UN PODER
 app.post('/api/powers', async (req, res) => {
   try {
     const { assemblyId, otorganteUnico, apoderadoUnico, documentoUrl } = req.body;
@@ -203,31 +203,27 @@ app.post('/api/powers', async (req, res) => {
       [assemblyId || 1, apoderadoUnico.toString().trim().toUpperCase()]
     );
 
-    if (otorgantes.length === 0) return res.status(400).json({ ok: false, error: 'El identificador del otorgante no existe.' });
-    if (apoderados.length === 0) return res.status(400).json({ ok: false, error: 'El identificador del apoderado no existe.' });
+    if (otorgantes.length === 0) return res.status(400).json({ ok: false, error: 'El otorgante no existe en el padrón.' });
+    if (apoderados.length === 0) return res.status(400).json({ ok: false, error: 'El apoderado no existe en el padrón.' });
 
     await db.query(
       `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado)
        VALUES (?, ?, ?, ?, 'pendiente')`,
-      [assemblyId || 1, otorgantes[0].id, apoderados[0].id, documentoUrl || 'https://via.placeholder.com/300?text=Poder+PDF']
+      [assemblyId || 1, otorgantes[0].id, apoderados[0].id, documentoUrl]
     );
 
-    res.json({ ok: true, message: 'Poder cargado exitosamente. Pendiente de aprobación administrativa.' });
+    res.json({ ok: true, message: 'Poder cargado exitosamente.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// API: CAMBIAR ESTADO DE PODER
 app.put('/api/powers/:powerId/status', async (req, res) => {
   try {
     const { powerId } = req.params;
     const { estado, observaciones } = req.body;
 
-    await db.query(
-      `UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`,
-      [estado, observaciones || '', powerId]
-    );
+    await db.query(`UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`, [estado, observaciones || '', powerId]);
 
     const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [powerId]);
     if (p.length > 0) {
@@ -241,15 +237,12 @@ app.put('/api/powers/:powerId/status', async (req, res) => {
   }
 });
 
-// ROUTE DE PRUEBA HTTP
 app.get('/', (req, res) => {
-  res.json({ status: 'online', system: 'Plataforma Multi-tenant de Asambleas', version: '1.3.0' });
+  res.json({ status: 'online', system: 'Plataforma Multi-tenant de Asambleas', version: '1.4.0' });
 });
 
 // WEBSOCKETS
 io.on('connection', (socket) => {
-  console.log(`🔌 Cliente conectado: ${socket.id}`);
-
   socket.on('auth:join', async ({ assemblyId, identificadorUnico }) => {
     try {
       const targetAssembly = parseInt(assemblyId) || 1;
@@ -262,9 +255,7 @@ io.on('connection', (socket) => {
         [targetAssembly, targetId]
       );
 
-      if (rows.length === 0) {
-        return socket.emit('auth:error', 'Identificador no registrado.');
-      }
+      if (rows.length === 0) return socket.emit('auth:error', 'Identificador no registrado.');
 
       const user = rows[0];
       const userId = user.id;
@@ -276,17 +267,11 @@ io.on('connection', (socket) => {
       } else if (activeSessions.has(sessionKey)) {
         const existingSession = activeSessions.get(sessionKey);
         if (existingSession.socketId !== socket.id) {
-          io.to(existingSession.socketId).emit('session:invalidated', {
-            message: 'Se ha iniciado sesión con este usuario desde otro dispositivo.'
-          });
+          io.to(existingSession.socketId).emit('session:invalidated', { message: 'Sesión iniciada desde otro dispositivo.' });
         }
       }
 
-      activeSessions.set(sessionKey, {
-        userId,
-        assemblyId: targetAssembly,
-        socketId: socket.id
-      });
+      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id });
 
       socket.sessionKey = sessionKey;
       socket.assemblyId = targetAssembly;
@@ -297,36 +282,24 @@ io.on('connection', (socket) => {
 
       await db.query(`UPDATE usuarios SET last_socket_id = ? WHERE id = ?`, [socket.id, userId]);
 
-      const efCoef = await getUserEffectiveCoefficient(userId, targetAssembly);
-      user.coeficienteEfectivo = efCoef;
-
+      user.coeficienteEfectivo = await getUserEffectiveCoefficient(userId, targetAssembly);
       socket.emit('auth:success', { user, room: roomName });
 
       await updateAndBroadcastQuorum(targetAssembly);
 
       if (activeQuestions.has(targetAssembly)) {
         const activeQ = activeQuestions.get(targetAssembly);
-        const [votoUsuario] = await db.query(
-          `SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`,
-          [activeQ.id, userId]
-        );
-        socket.emit('voting:current_state', {
-          ...activeQ,
-          myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null
-        });
+        const [votoUsuario] = await db.query(`SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`, [activeQ.id, userId]);
+        socket.emit('voting:current_state', { ...activeQ, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
       }
-
     } catch (error) {
-      console.error('Error en auth:join:', error);
       socket.emit('auth:error', 'Error interno al autenticar.');
     }
   });
 
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
     try {
-      if (timerIntervals.has(assemblyId)) {
-        clearInterval(timerIntervals.get(assemblyId));
-      }
+      if (timerIntervals.has(assemblyId)) clearInterval(timerIntervals.get(assemblyId));
 
       await db.query(`UPDATE preguntas SET estado = 'activa' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
 
@@ -336,27 +309,17 @@ io.on('connection', (socket) => {
       if (preguntas.length === 0) return;
 
       const duracion = parseInt(duracionSegundos) || 60;
-
-      const activeQData = {
-        id: preguntas[0].id,
-        texto: preguntas[0].texto_pregunta,
-        opciones,
-        duracion,
-        tiempoRestante: duracion,
-        isOpen: true
-      };
+      const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true };
 
       activeQuestions.set(assemblyId, activeQData);
       const roomName = `assembly_${assemblyId}`;
 
       io.to(roomName).emit('voting:started', activeQData);
+      io.to(roomName).emit('questions:updated');
 
       const interval = setInterval(async () => {
         const currentQ = activeQuestions.get(assemblyId);
-        if (!currentQ) {
-          clearInterval(interval);
-          return;
-        }
+        if (!currentQ) { clearInterval(interval); return; }
 
         currentQ.tiempoRestante -= 1;
         io.to(roomName).emit('timer:tick', { tiempoRestante: currentQ.tiempoRestante });
@@ -369,19 +332,40 @@ io.on('connection', (socket) => {
           await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ?`, [preguntaId]);
           const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
 
-          io.to(roomName).emit('voting:closed', {
-            preguntaId,
-            resultados: finalResults
-          });
-
+          io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults });
+          io.to(roomName).emit('questions:updated');
           activeQuestions.delete(assemblyId);
         }
       }, 1000);
 
       timerIntervals.set(assemblyId, interval);
-
     } catch (error) {
       console.error('Error al iniciar votación:', error);
+    }
+  });
+
+  // DETENER VOTACIÓN MANUALMENTE
+  socket.on('admin:stop_voting', async ({ assemblyId, preguntaId }) => {
+    try {
+      if (timerIntervals.has(assemblyId)) {
+        clearInterval(timerIntervals.get(assemblyId));
+        timerIntervals.delete(assemblyId);
+      }
+
+      const currentQ = activeQuestions.get(assemblyId);
+      if (currentQ) {
+        currentQ.isOpen = false;
+        activeQuestions.delete(assemblyId);
+      }
+
+      await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
+      const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
+
+      const roomName = `assembly_${assemblyId}`;
+      io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults });
+      io.to(roomName).emit('questions:updated');
+    } catch (error) {
+      console.error('Error al detener votación:', error);
     }
   });
 
@@ -405,7 +389,6 @@ io.on('connection', (socket) => {
       socket.emit('vote:confirmed', { opcionId });
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
       io.to(`assembly_${assemblyId}`).emit('voting:results_update', { resultados: updatedResults });
-
     } catch (error) {
       console.error('Error al registrar voto:', error);
     }
@@ -417,9 +400,7 @@ io.on('connection', (socket) => {
       const sessionData = activeSessions.get(socket.sessionKey);
 
       if (sessionData.socketId === socket.id) {
-        if (disconnectTimeouts.has(sessionKey)) {
-          clearTimeout(disconnectTimeouts.get(sessionKey));
-        }
+        if (disconnectTimeouts.has(sessionKey)) clearTimeout(disconnectTimeouts.get(sessionKey));
 
         const timeoutId = setTimeout(async () => {
           activeSessions.delete(sessionKey);
@@ -434,6 +415,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Servidor de Asambleas v1.3 corriendo en puerto ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.4 corriendo en puerto ${PORT}`));
