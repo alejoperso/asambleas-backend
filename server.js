@@ -20,6 +20,12 @@ const activeSessions = new Map();
 const disconnectTimeouts = new Map(); 
 const GRACE_PERIOD_MS = 10 * 60 * 1000; 
 
+// HELPER: ENCODER BASE64URL ESTÁNDAR PARA ZOOM JWT
+function toBase64Url(input) {
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
+  return buf.toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
 // HELPER: EXTRAER ID Y CLAVE REAL
 function parseZoomCredentials(rawUrl, manualPasscode) {
   if (!rawUrl || typeof rawUrl !== 'string') return { meetingId: '', passcode: '' };
@@ -51,7 +57,6 @@ app.post('/api/zoom/signature', (req, res) => {
     const exp = iat + 60 * 60 * 2; // Validez de 2 horas
 
     const oHeader = { alg: 'HS256', typ: 'JWT' };
-    
     const oPayload = {
       sdkKey: sdkKey,
       appKey: sdkKey,
@@ -62,14 +67,12 @@ app.post('/api/zoom/signature', (req, res) => {
       tokenExp: exp
     };
 
-    const sHeader = Buffer.from(JSON.stringify(oHeader)).toString('base64url');
-    const sPayload = Buffer.from(JSON.stringify(oPayload)).toString('base64url');
+    const sHeader = toBase64Url(JSON.stringify(oHeader));
+    const sPayload = toBase64Url(JSON.stringify(oPayload));
     const dataToSign = `${sHeader}.${sPayload}`;
 
-    const signature = crypto
-      .createHmac('sha256', sdkSecret)
-      .update(dataToSign)
-      .digest('base64url');
+    const hmac = crypto.createHmac('sha256', sdkSecret).update(dataToSign).digest();
+    const signature = toBase64Url(hmac);
 
     const jwtToken = `${dataToSign}.${signature}`;
 
@@ -408,7 +411,7 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.4-sdk' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.5-sdk' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -570,4 +573,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.4-sdk corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.5-sdk corriendo en puerto ${PORT}`));
