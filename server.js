@@ -7,15 +7,11 @@ const db = require('./db');
 
 const app = express();
 app.use(cors());
-// SOPORTE PARA CARGA DE IMÁGENES Y PDFS EN BASE64
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
 const server = http.createServer(app);
-
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
-});
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 
 const activeQuestions = new Map();
 const timerIntervals = new Map();
@@ -35,11 +31,9 @@ async function getUserEffectiveCoefficient(userId, assemblyId) {
        GROUP BY u.id`,
       [assemblyId, userId, assemblyId]
     );
-
     if (rows.length === 0) return 0.00000;
     return (parseFloat(rows[0].coeficiente) || 0) + (parseFloat(rows[0].coef_poderes) || 0);
   } catch (err) {
-    console.error('Error calculando coeficiente efectivo:', err);
     return 0.00000;
   }
 }
@@ -48,21 +42,16 @@ async function updateAndBroadcastQuorum(assemblyId) {
   try {
     const activeUserIds = [];
     for (const [key, session] of activeSessions.entries()) {
-      if (session.assemblyId === parseInt(assemblyId)) {
-        activeUserIds.push(session.userId);
-      }
+      if (session.assemblyId === parseInt(assemblyId)) activeUserIds.push(session.userId);
     }
-
     if (activeUserIds.length === 0) {
       io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage: "0.0000" });
       return;
     }
-
     let totalQuorum = 0;
     for (let uId of activeUserIds) {
       totalQuorum += await getUserEffectiveCoefficient(uId, assemblyId);
     }
-
     const quorumPercentage = (totalQuorum * 100).toFixed(4);
     io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
   } catch (err) {
@@ -72,54 +61,35 @@ async function updateAndBroadcastQuorum(assemblyId) {
 
 async function calculateWeightedResults(assemblyId, preguntaId) {
   const [votos] = await db.query(
-    `SELECT v.opcion_id, v.coeficiente_aplicado 
-     FROM votos v 
-     WHERE v.assembly_id = ? AND v.pregunta_id = ?`,
+    `SELECT v.opcion_id, v.coeficiente_aplicado FROM votos v WHERE v.assembly_id = ? AND v.pregunta_id = ?`,
     [assemblyId, preguntaId]
   );
-
   const [opciones] = await db.query(
     `SELECT id, texto_opcion FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`,
     [preguntaId]
   );
-
   const results = {};
   opciones.forEach(opt => {
-    results[opt.id] = {
-      id: opt.id,
-      texto: opt.texto_opcion,
-      votosConteo: 0,
-      coeficienteAcumulado: 0.00000
-    };
+    results[opt.id] = { id: opt.id, texto: opt.texto_opcion, votosConteo: 0, coeficienteAcumulado: 0.00000 };
   });
-
   votos.forEach(voto => {
     if (results[voto.opcion_id]) {
       results[voto.opcion_id].votosConteo += 1;
       results[voto.opcion_id].coeficienteAcumulado += parseFloat(voto.coeficiente_aplicado);
     }
   });
-
   return results;
 }
 
-// REST API
+// REST API: PREGUNTAS
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
-    const [preguntas] = await db.query(
-      `SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC`,
-      [assemblyId]
-    );
-
+    const [preguntas] = await db.query(`SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC`, [assemblyId]);
     for (let p of preguntas) {
-      const [opciones] = await db.query(
-        `SELECT * FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`,
-        [p.id]
-      );
+      const [opciones] = await db.query(`SELECT * FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`, [p.id]);
       p.opciones = opciones;
     }
-
     res.json({ ok: true, preguntas });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -129,41 +99,118 @@ app.get('/api/questions/:assemblyId', async (req, res) => {
 app.post('/api/questions', async (req, res) => {
   try {
     const { assemblyId, textoPregunta, duracionSegundos, opciones } = req.body;
-    if (!textoPregunta || !opciones || opciones.length < 2) {
-      return res.status(400).json({ ok: false, error: 'Debes proporcionar una pregunta y al menos 2 opciones.' });
-    }
-
     const [result] = await db.query(
       `INSERT INTO preguntas (assembly_id, texto_pregunta, duracion_segundos, estado) VALUES (?, ?, ?, 'borrador')`,
       [assemblyId || 1, textoPregunta, parseInt(duracionSegundos) || 60]
     );
-
     const preguntaId = result.insertId;
     for (let i = 0; i < opciones.length; i++) {
-      await db.query(
-        `INSERT INTO opciones_pregunta (pregunta_id, texto_opcion, orden) VALUES (?, ?, ?)`,
-        [preguntaId, opciones[i], i + 1]
-      );
+      await db.query(`INSERT INTO opciones_pregunta (pregunta_id, texto_opcion, orden) VALUES (?, ?, ?)`, [preguntaId, opciones[i], i + 1]);
     }
-
-    res.json({ ok: true, preguntaId, message: 'Pregunta creada exitosamente.' });
+    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
+    res.json({ ok: true, preguntaId });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// REINICIAR VOTACIÓN (BORRAR VOTOS REGISTRADOS Y RESTAURAR ESTADO)
+// EDITAR PREGUNTA
+app.put('/api/questions/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { textoPregunta, duracionSegundos, opciones, assemblyId } = req.body;
+    await db.query(`UPDATE preguntas SET texto_pregunta = ?, duracion_segundos = ? WHERE id = ?`, [textoPregunta, parseInt(duracionSegundos) || 60, id]);
+    
+    if (opciones && opciones.length >= 2) {
+      await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id = ?`, [id]);
+      for (let i = 0; i < opciones.length; i++) {
+        await db.query(`INSERT INTO opciones_pregunta (pregunta_id, texto_opcion, orden) VALUES (?, ?, ?)`, [id, opciones[i], i + 1]);
+      }
+    }
+    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
+    res.json({ ok: true, message: 'Pregunta actualizada.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ELIMINAR PREGUNTA DE FORMA SEGURA
+app.delete('/api/questions/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { assemblyId } = req.query;
+    await db.query(`DELETE FROM votos WHERE pregunta_id = ?`, [id]);
+    await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id = ?`, [id]);
+    await db.query(`DELETE FROM preguntas WHERE id = ?`, [id]);
+    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
+    res.json({ ok: true, message: 'Pregunta eliminada.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/questions/:id/reset', async (req, res) => {
   try {
     const { id } = req.params;
     const { assemblyId } = req.body;
-    const targetAssembly = assemblyId || 1;
+    await db.query(`DELETE FROM votos WHERE pregunta_id = ?`, [id]);
+    await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE id = ?`, [id]);
+    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-    await db.query(`DELETE FROM votos WHERE pregunta_id = ? AND assembly_id = ?`, [id, targetAssembly]);
-    await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE id = ? AND assembly_id = ?`, [id, targetAssembly]);
+// BUSCADOR DE USUARIOS PARA ADMINISTRACIÓN DE PODERES
+app.get('/api/users/:assemblyId', async (req, res) => {
+  try {
+    const { assemblyId } = req.params;
+    const { search } = req.query;
+    let sql = `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol FROM usuarios WHERE assembly_id = ?`;
+    let params = [assemblyId];
 
-    io.to(`assembly_${targetAssembly}`).emit('questions:updated');
-    res.json({ ok: true, message: 'Votación reiniciada exitosamente.' });
+    if (search) {
+      sql += ` AND (UPPER(identificador_unico) LIKE ? OR UPPER(nombre_completo) LIKE ? OR UPPER(unidad) LIKE ?)`;
+      const term = `%${search.toUpperCase()}%`;
+      params.push(term, term, term);
+    }
+    sql += ` ORDER BY unidad ASC LIMIT 50`;
+    const [usuarios] = await db.query(sql, params);
+    res.json({ ok: true, usuarios });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ASIGNACIÓN DIRECTA O ELIMINACIÓN DE PODER POR PARTE DEL ADMIN
+app.post('/api/powers/manual', async (req, res) => {
+  try {
+    const { assemblyId, otorganteId, apoderadoId } = req.body;
+    await db.query(
+      `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado, observaciones)
+       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMINISTRADOR', 'autorizado', 'Asignado manualmente desde consola admin')
+       ON DUPLICATE KEY UPDATE apoderado_id = VALUES(apoderado_id), estado = 'autorizado'`,
+      [assemblyId || 1, otorganteId, apoderadoId]
+    );
+    await updateAndBroadcastQuorum(assemblyId || 1);
+    io.to(`assembly_${assemblyId || 1}`).emit('powers:updated');
+    res.json({ ok: true, message: 'Poder asignado manualmente.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/powers/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
+    await db.query(`DELETE FROM poderes WHERE id = ?`, [id]);
+    if (p.length > 0) {
+      await updateAndBroadcastQuorum(p[0].assembly_id);
+      io.to(`assembly_${p[0].assembly_id}`).emit('powers:updated');
+    }
+    res.json({ ok: true, message: 'Poder eliminado.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -174,8 +221,8 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
     const { assemblyId } = req.params;
     const [poderes] = await db.query(
       `SELECT p.id, p.estado, p.documento_url, p.observaciones, p.created_at,
-              u_ot.identificador_unico AS otorgante_id, u_ot.nombre_completo AS otorgante_nombre, u_ot.coeficiente AS otorgante_coef,
-              u_ap.identificador_unico AS apoderado_id, u_ap.nombre_completo AS apoderado_nombre
+              u_ot.id AS otorgante_num_id, u_ot.identificador_unico AS otorgante_id, u_ot.nombre_completo AS otorgante_nombre, u_ot.coeficiente AS otorgante_coef,
+              u_ap.id AS apoderado_num_id, u_ap.identificador_unico AS apoderado_id, u_ap.nombre_completo AS apoderado_nombre
        FROM poderes p
        JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
        JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
@@ -192,27 +239,18 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
 app.post('/api/powers', async (req, res) => {
   try {
     const { assemblyId, otorganteUnico, apoderadoUnico, documentoUrl } = req.body;
+    const [otorgantes] = await db.query(`SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`, [assemblyId || 1, otorganteUnico.toString().trim().toUpperCase()]);
+    const [apoderados] = await db.query(`SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`, [assemblyId || 1, apoderadoUnico.toString().trim().toUpperCase()]);
 
-    const [otorgantes] = await db.query(
-      `SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-      [assemblyId || 1, otorganteUnico.toString().trim().toUpperCase()]
-    );
-
-    const [apoderados] = await db.query(
-      `SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-      [assemblyId || 1, apoderadoUnico.toString().trim().toUpperCase()]
-    );
-
-    if (otorgantes.length === 0) return res.status(400).json({ ok: false, error: 'El otorgante no existe en el padrón.' });
-    if (apoderados.length === 0) return res.status(400).json({ ok: false, error: 'El apoderado no existe en el padrón.' });
+    if (otorgantes.length === 0) return res.status(400).json({ ok: false, error: 'El otorgante no existe.' });
+    if (apoderados.length === 0) return res.status(400).json({ ok: false, error: 'El apoderado no existe.' });
 
     await db.query(
-      `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado)
-       VALUES (?, ?, ?, ?, 'pendiente')`,
+      `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado) VALUES (?, ?, ?, ?, 'pendiente')`,
       [assemblyId || 1, otorgantes[0].id, apoderados[0].id, documentoUrl]
     );
-
-    res.json({ ok: true, message: 'Poder cargado exitosamente.' });
+    io.to(`assembly_${assemblyId || 1}`).emit('powers:updated');
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -222,24 +260,51 @@ app.put('/api/powers/:powerId/status', async (req, res) => {
   try {
     const { powerId } = req.params;
     const { estado, observaciones } = req.body;
-
     await db.query(`UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`, [estado, observaciones || '', powerId]);
-
     const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [powerId]);
     if (p.length > 0) {
       await updateAndBroadcastQuorum(p[0].assembly_id);
       io.to(`assembly_${p[0].assembly_id}`).emit('powers:updated');
     }
-
-    res.json({ ok: true, message: `Poder ${estado} correctamente.` });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.get('/', (req, res) => {
-  res.json({ status: 'online', system: 'Plataforma Multi-tenant de Asambleas', version: '1.4.0' });
+// SUPER ADMINISTRADOR: ASAMBLEAS
+app.get('/api/super/assemblies', async (req, res) => {
+  try {
+    const [asambleas] = await db.query(`SELECT * FROM asambleas ORDER BY id DESC`);
+    res.json({ ok: true, asambleas });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
+
+app.post('/api/super/assemblies', async (req, res) => {
+  try {
+    const { nombreCopropiedad, fechaEvento, adminId, adminNombre } = req.body;
+    const [resAsamblea] = await db.query(
+      `INSERT INTO asambleas (nombre_copropiedad, fecha_evento, estado) VALUES (?, ?, 'en_vivo')`,
+      [nombreCopropiedad, fechaEvento || new Date()]
+    );
+    const newAssemblyId = resAsamblea.insertId;
+
+    if (adminId) {
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
+         VALUES (?, ?, ?, 'Administración', 0.00000, 'administrador')`,
+        [newAssemblyId, adminId.toUpperCase(), adminNombre || 'Administrador Asignado']
+      );
+    }
+    res.json({ ok: true, assemblyId: newAssemblyId, message: 'Asamblea creada con éxito.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/', (req, res) => res.json({ status: 'online', version: '1.5.0' }));
 
 // WEBSOCKETS
 io.on('connection', (socket) => {
@@ -250,8 +315,7 @@ io.on('connection', (socket) => {
 
       const [rows] = await db.query(
         `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol 
-         FROM usuarios 
-         WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
+         FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
         [targetAssembly, targetId]
       );
 
@@ -272,7 +336,6 @@ io.on('connection', (socket) => {
       }
 
       activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id });
-
       socket.sessionKey = sessionKey;
       socket.assemblyId = targetAssembly;
       socket.userId = userId;
@@ -280,13 +343,12 @@ io.on('connection', (socket) => {
       const roomName = `assembly_${targetAssembly}`;
       socket.join(roomName);
 
-      await db.query(`UPDATE usuarios SET last_socket_id = ? WHERE id = ?`, [socket.id, userId]);
-
       user.coeficienteEfectivo = await getUserEffectiveCoefficient(userId, targetAssembly);
       socket.emit('auth:success', { user, room: roomName });
 
       await updateAndBroadcastQuorum(targetAssembly);
 
+      // RESTAURACIÓN DE VOTACIÓN EN CURSO AL REFRESCAR LA PÁGINA
       if (activeQuestions.has(targetAssembly)) {
         const activeQ = activeQuestions.get(targetAssembly);
         const [votoUsuario] = await db.query(`SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`, [activeQ.id, userId]);
@@ -300,12 +362,10 @@ io.on('connection', (socket) => {
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
     try {
       if (timerIntervals.has(assemblyId)) clearInterval(timerIntervals.get(assemblyId));
-
       await db.query(`UPDATE preguntas SET estado = 'activa' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
 
       const [preguntas] = await db.query(`SELECT id, texto_pregunta FROM preguntas WHERE id = ?`, [preguntaId]);
       const [opciones] = await db.query(`SELECT id, texto_opcion FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`, [preguntaId]);
-
       if (preguntas.length === 0) return;
 
       const duracion = parseInt(duracionSegundos) || 60;
@@ -344,19 +404,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // DETENER VOTACIÓN MANUALMENTE
   socket.on('admin:stop_voting', async ({ assemblyId, preguntaId }) => {
     try {
       if (timerIntervals.has(assemblyId)) {
         clearInterval(timerIntervals.get(assemblyId));
         timerIntervals.delete(assemblyId);
       }
-
       const currentQ = activeQuestions.get(assemblyId);
-      if (currentQ) {
-        currentQ.isOpen = false;
-        activeQuestions.delete(assemblyId);
-      }
+      if (currentQ) { currentQ.isOpen = false; activeQuestions.delete(assemblyId); }
 
       await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
       const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
@@ -371,21 +426,19 @@ io.on('connection', (socket) => {
 
   socket.on('vote:submit', async ({ opcionId }) => {
     const { assemblyId, userId } = socket;
-    if (!assemblyId || !userId) return socket.emit('vote:error', 'No autenticado.');
+    if (!assemblyId || !userId) return;
 
     const currentQ = activeQuestions.get(assemblyId);
-    if (!currentQ || !currentQ.isOpen) return socket.emit('vote:error', 'La votación no está activa.');
+    if (!currentQ || !currentQ.isOpen) return;
 
     try {
       const efCoef = await getUserEffectiveCoefficient(userId, assemblyId);
-
       await db.query(
         `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
          VALUES (?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE opcion_id = VALUES(opcion_id), coeficiente_aplicado = VALUES(coeficiente_aplicado)`,
         [assemblyId, currentQ.id, userId, opcionId, efCoef]
       );
-
       socket.emit('vote:confirmed', { opcionId });
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
       io.to(`assembly_${assemblyId}`).emit('voting:results_update', { resultados: updatedResults });
@@ -398,16 +451,13 @@ io.on('connection', (socket) => {
     if (socket.sessionKey && activeSessions.has(socket.sessionKey)) {
       const sessionKey = socket.sessionKey;
       const sessionData = activeSessions.get(socket.sessionKey);
-
       if (sessionData.socketId === socket.id) {
         if (disconnectTimeouts.has(sessionKey)) clearTimeout(disconnectTimeouts.get(sessionKey));
-
         const timeoutId = setTimeout(async () => {
           activeSessions.delete(sessionKey);
           disconnectTimeouts.delete(sessionKey);
           await updateAndBroadcastQuorum(sessionData.assemblyId);
         }, GRACE_PERIOD_MS);
-
         disconnectTimeouts.set(sessionKey, timeoutId);
       }
     }
@@ -415,4 +465,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.4 corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.5.0 corriendo en puerto ${PORT}`));
