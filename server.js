@@ -164,7 +164,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
 app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   try {
     try {
-      const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url FROM asambleas ORDER BY id DESC`);
+      const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, estado FROM asambleas ORDER BY id DESC`);
       return res.json({ ok: true, asambleas: rows, assemblies: rows });
     } catch (e) {
       return res.json({ ok: true, asambleas: memoryAssemblies, assemblies: memoryAssemblies });
@@ -216,17 +216,19 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     const logoUrl = logoBase64 || 'https://via.placeholder.com/150x40?text=Copropiedad';
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
 
+    // Se incluye fecha_evento (NOW()) para cumplir la restricción NOT NULL de la tabla asambleas
     const [result] = await db.query(
-      `INSERT INTO asambleas (nombre_copropiedad, logo_url, zoom_embed_url, zoom_meeting_id, zoom_passcode) VALUES (?, ?, ?, ?, ?)`,
-      [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode]
+      `INSERT INTO asambleas (nombre_copropiedad, logo_url, fecha_evento, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
+       VALUES (?, ?, NOW(), 'programada', ?, ?, ?, ?)`,
+      [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode, parsed.passcode]
     );
     const assemblyId = result.insertId;
 
     if (adminIdentificador && adminIdentificador.trim() !== '') {
       await db.query(
         `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
-         VALUES (?, ?, 'Administrador Copropiedad', 'ADMIN', 0.00000, 'admin')
-         ON DUPLICATE KEY UPDATE rol = 'admin'`,
+         VALUES (?, ?, 'Administrador Copropiedad', 'ADMIN', 0.00000, 'administrador')
+         ON DUPLICATE KEY UPDATE rol = 'administrador'`,
         [assemblyId, adminIdentificador.trim().toUpperCase()]
       );
     }
@@ -254,7 +256,7 @@ app.post('/api/superadmin/assign-role', async (req, res) => {
       `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
        VALUES (?, ?, ?, 'DIRECTIVA', 0.00000, ?)
        ON DUPLICATE KEY UPDATE rol = VALUES(rol), nombre_completo = VALUES(nombre_completo)`,
-      [assemblyId || 1, targetId, nombreCompleto || 'Directiva', rol || 'admin']
+      [assemblyId || 1, targetId, nombreCompleto || 'Directiva', rol || 'administrador']
     );
     res.json({ ok: true, message: `Rol ${rol} asignado exitosamente a ${targetId}.` });
   } catch (err) {
