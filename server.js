@@ -102,7 +102,6 @@ async function getUserPowerDetails(userId, assemblyId) {
 
 async function getUserEffectiveCoefficient(userId, assemblyId) {
   const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
-  // SI EL USUARIO TIENE PODER AUTORIZADO A OTRO O ES DE SOPORTE, SU COEFICIENTE EFECTIVO ES 0
   if (isRepresented) return 0;
 
   const [u] = await db.query(`SELECT coeficiente, rol FROM usuarios WHERE id = ?`, [userId]);
@@ -161,7 +160,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: ASAMBLEAS ACTIVAS PARA LANDING PAGE (SOPORTE PARA AMBAS RUTAS)
+// REST API: ASAMBLEAS ACTIVAS PARA LANDING PAGE
 app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   try {
     try {
@@ -215,40 +214,35 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
   try {
     const { nombreCopropiedad, logoBase64, adminIdentificador, zoomEmbedUrl, zoomPasscode } = req.body;
     const logoUrl = logoBase64 || 'https://via.placeholder.com/150x40?text=Copropiedad';
-    try {
-      const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
-      const [result] = await db.query(
-        `INSERT INTO asambleas (nombre_copropiedad, logo_url, zoom_embed_url, zoom_meeting_id, zoom_passcode) VALUES (?, ?, ?, ?, ?)`,
-        [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode]
-      );
-      const assemblyId = result.insertId;
+    const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
 
-      if (adminIdentificador) {
-        await db.query(
-          `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
-           VALUES (?, ?, 'Administrador Copropiedad', 'ADMIN', 0.00000, 'admin')
-           ON DUPLICATE KEY UPDATE rol = 'admin'`,
-          [assemblyId, adminIdentificador.trim().toUpperCase()]
-        );
-      }
+    const [result] = await db.query(
+      `INSERT INTO asambleas (nombre_copropiedad, logo_url, zoom_embed_url, zoom_meeting_id, zoom_passcode) VALUES (?, ?, ?, ?, ?)`,
+      [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode]
+    );
+    const assemblyId = result.insertId;
 
-      // Crear usuario de soporte por defecto para la asamblea creada
+    if (adminIdentificador && adminIdentificador.trim() !== '') {
       await db.query(
         `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
-         VALUES (?, ?, 'Soporte Técnico', 'SOPORTE', 0.00000, 'soporte')
-         ON DUPLICATE KEY UPDATE rol = 'soporte'`,
-        [assemblyId, `SOPORTE-${assemblyId}`]
+         VALUES (?, ?, 'Administrador Copropiedad', 'ADMIN', 0.00000, 'admin')
+         ON DUPLICATE KEY UPDATE rol = 'admin'`,
+        [assemblyId, adminIdentificador.trim().toUpperCase()]
       );
-
-      io.emit('assemblies:updated');
-      res.json({ ok: true, assemblyId, message: 'Asamblea creada con éxito.' });
-    } catch (e) {
-      const newAss = { id: Date.now(), nombre_copropiedad: nombreCopropiedad, logo_url: logoUrl, admin_user: adminIdentificador };
-      memoryAssemblies.push(newAss);
-      res.json({ ok: true, assemblyId: newAss.id });
     }
+
+    await db.query(
+      `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
+       VALUES (?, ?, 'Soporte Técnico', 'SOPORTE', 0.00000, 'soporte')
+       ON DUPLICATE KEY UPDATE rol = 'soporte'`,
+      [assemblyId, `SOPORTE-${assemblyId}`]
+    );
+
+    io.emit('assemblies:updated');
+    return res.json({ ok: true, assemblyId, message: 'Asamblea creada con éxito.' });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    console.error('Error crítico al crear asamblea en MySQL:', err);
+    return res.status(500).json({ ok: false, error: `Error SQL: ${err.message}` });
   }
 });
 
