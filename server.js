@@ -60,7 +60,7 @@ async function checkUserRepresentedStatus(userId, assemblyId) {
   }
 }
 
-// DETALLE DE PODERES Y CÁLCULO DE COEFICIENTE
+// DETALLE DE PODERES Y CÁLCULO DE COEFICIENTES
 async function getUserPowerDetails(userId, assemblyId) {
   try {
     const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
@@ -102,11 +102,14 @@ async function getUserPowerDetails(userId, assemblyId) {
 
 async function getUserEffectiveCoefficient(userId, assemblyId) {
   const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
-  // SI EL USUARIO TIENE PODER AUTORIZADO A OTRO, SU COEFICIENTES ES 0 PARA EVITAR VOTO DUPLICADO
+  // SI EL USUARIO TIENE PODER AUTORIZADO A OTRO O ES DE SOPORTE, SU COEFICIENTE EFECTIVO ES 0
   if (isRepresented) return 0;
 
-  const [u] = await db.query(`SELECT coeficiente FROM usuarios WHERE id = ?`, [userId]);
-  const propio = u.length > 0 ? parseFloat(u[0].coeficiente) || 0 : 0;
+  const [u] = await db.query(`SELECT coeficiente, rol FROM usuarios WHERE id = ?`, [userId]);
+  if (u.length === 0) return 0;
+  if (u[0].rol === 'soporte') return 0;
+
+  const propio = parseFloat(u[0].coeficiente) || 0;
   const { coefPoderes } = await getUserPowerDetails(userId, assemblyId);
   return propio + coefPoderes;
 }
@@ -158,14 +161,36 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: ASAMBLEAS ACTIVAS PARA LANDING PAGE
-app.get('/api/assemblies/active', async (req, res) => {
+// REST API: ASAMBLEAS ACTIVAS PARA LANDING PAGE (SOPORTE PARA AMBAS RUTAS)
+app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   try {
     try {
       const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url FROM asambleas ORDER BY id DESC`);
-      return res.json({ ok: true, asambleas: rows });
+      return res.json({ ok: true, asambleas: rows, assemblies: rows });
     } catch (e) {
-      return res.json({ ok: true, asambleas: memoryAssemblies });
+      return res.json({ ok: true, asambleas: memoryAssemblies, assemblies: memoryAssemblies });
+    }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: CREAR USUARIO DE SOPORTE PERMANENTE
+app.post('/api/support-users', async (req, res) => {
+  try {
+    const { assemblyId, identificadorUnico, nombreCompleto } = req.body;
+    const targetId = identificadorUnico.trim().toUpperCase();
+
+    try {
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
+         VALUES (?, ?, ?, 'SOPORTE', 0.00000, 'soporte')
+         ON DUPLICATE KEY UPDATE rol = 'soporte', nombre_completo = VALUES(nombre_completo)`,
+        [assemblyId || 1, targetId, nombreCompleto || 'Soporte Técnico']
+      );
+      res.json({ ok: true, message: `Usuario de soporte ${targetId} creado correctamente.` });
+    } catch (e) {
+      res.json({ ok: true, message: `Usuario de soporte ${targetId} registrado.` });
     }
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -206,6 +231,16 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
           [assemblyId, adminIdentificador.trim().toUpperCase()]
         );
       }
+
+      // Crear usuario de soporte por defecto para la asamblea creada
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
+         VALUES (?, ?, 'Soporte Técnico', 'SOPORTE', 0.00000, 'soporte')
+         ON DUPLICATE KEY UPDATE rol = 'soporte'`,
+        [assemblyId, `SOPORTE-${assemblyId}`]
+      );
+
+      io.emit('assemblies:updated');
       res.json({ ok: true, assemblyId, message: 'Asamblea creada con éxito.' });
     } catch (e) {
       const newAss = { id: Date.now(), nombre_copropiedad: nombreCopropiedad, logo_url: logoUrl, admin_user: adminIdentificador };
@@ -599,10 +634,20 @@ io.on('connection', (socket) => {
       const targetAssembly = parseInt(assemblyId) || 1;
       const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
 
-      const [rows] = await db.query(
+      let [rows] = await db.query(
         `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
         [targetAssembly, targetId]
       );
+
+      // SOPORTE DINÁMICO EN CASO DE INGRESAR CON CÓDIGO DE SOPORTE SINO EXISTÍA
+      if (rows.length === 0 && targetId.startsWith('SOPORTE')) {
+        const [ins] = await db.query(
+          `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
+           VALUES (?, ?, 'Soporte Técnico', 'SOPORTE', 0.00000, 'soporte')`,
+          [targetAssembly, targetId]
+        );
+        rows = [{ id: ins.insertId, identificador_unico: targetId, nombre_completo: 'Soporte Técnico', unidad: 'SOPORTE', coeficiente: 0.00000, rol: 'soporte' }];
+      }
 
       if (rows.length === 0) return socket.emit('auth:error', 'Identificador no registrado.');
 
@@ -630,7 +675,7 @@ io.on('connection', (socket) => {
       const { coefPoderes, representadosAprobados, representadosPendientes, isRepresented } = await getUserPowerDetails(userId, targetAssembly);
       user.coeficientePropio = parseFloat(user.coeficiente) || 0;
       user.coeficientePoderes = coefPoderes;
-      user.coeficienteEfectivo = isRepresented ? 0 : (user.coeficientePropio + coefPoderes);
+      user.coeficienteEfectivo = (isRepresented || user.rol === 'soporte') ? 0 : (user.coeficientePropio + coefPoderes);
       user.isRepresented = isRepresented;
       user.poderesAprobados = representadosAprobados;
       user.poderesPendientes = representadosPendientes;
@@ -727,7 +772,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // BLOQUEO ABSOLUTO DE VOTO PARA USUARIOS REPRESENTADOS
+  // BLOQUEO ABSOLUTO DE VOTO PARA USUARIOS REPRESENTADOS O SOPORTE
   socket.on('vote:submit', async ({ opcionId }) => {
     const { assemblyId, userId } = socket;
     if (!assemblyId || !userId) return;
