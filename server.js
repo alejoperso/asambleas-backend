@@ -8,8 +8,8 @@ const db = require('./db');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ limit: '15mb', extended: true }));
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ limit: '25mb', extended: true }));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
@@ -26,7 +26,7 @@ function toBase64Url(input) {
   return buf.toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-// HELPER: EXTRAER ID Y CLAVE REAL
+// HELPER: EXTRAER ID Y CLAVE REAL DE ZOOM
 function parseZoomCredentials(rawUrl, manualPasscode) {
   if (!rawUrl || typeof rawUrl !== 'string') return { meetingId: '', passcode: '' };
   const url = rawUrl.trim();
@@ -35,6 +35,39 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
   const passcode = (manualPasscode || '').trim();
   return { meetingId, passcode };
 }
+
+// TABLAS AUXILIARES EN MEMORIA (SI NO EXISTEN EN BD)
+const memoryDocuments = [];
+const memoryChat = [];
+
+// REST API: DETALLES DE LA ASAMBLEA (BRANDING)
+app.get('/api/assemblies/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
+    if (rows.length === 0) {
+      return res.json({
+        ok: true,
+        assembly: { id: 1, nombre_copropiedad: 'Asamblea General General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad' }
+      });
+    }
+    res.json({ ok: true, assembly: rows[0] });
+  } catch (err) {
+    res.json({ ok: true, assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad' } });
+  }
+});
+
+app.put('/api/assemblies/:id/info', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nombreCopropiedad, logoUrl } = req.body;
+    await db.query(`UPDATE asambleas SET nombre_copropiedad = ?, logo_url = ? WHERE id = ?`, [nombreCopropiedad, logoUrl, id]);
+    io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl });
+    res.json({ ok: true, message: 'Información de copropiedad actualizada.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // REST API: GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM
 app.post('/api/zoom/signature', (req, res) => {
@@ -122,6 +155,54 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
     io.to(`assembly_${id}`).emit('zoom:updated', { streamInfo: streamData });
 
     res.json({ ok: true, message: 'Configuración guardada correctamente.', streamInfo: streamData });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: REPOSITORIO DE DOCUMENTOS
+app.get('/api/documents/:assemblyId', async (req, res) => {
+  try {
+    const { assemblyId } = req.params;
+    try {
+      const [rows] = await db.query(`SELECT id, titulo, archivo_url, created_at FROM documentos WHERE assembly_id = ? ORDER BY created_at DESC`, [assemblyId]);
+      return res.json({ ok: true, documentos: rows });
+    } catch (e) {
+      const docs = memoryDocuments.filter(d => d.assemblyId == assemblyId);
+      return res.json({ ok: true, documentos: docs });
+    }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/documents', async (req, res) => {
+  try {
+    const { assemblyId, titulo, archivoUrl } = req.body;
+    const targetAssembly = assemblyId || 1;
+    try {
+      await db.query(`INSERT INTO documentos (assembly_id, titulo, archivo_url) VALUES (?, ?, ?)`, [targetAssembly, titulo, archivoUrl]);
+    } catch (e) {
+      memoryDocuments.push({ id: Date.now(), assemblyId: targetAssembly, titulo, archivo_url: archivoUrl, created_at: new Date() });
+    }
+    io.to(`assembly_${targetAssembly}`).emit('documents:updated');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/documents/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    try {
+      await db.query(`DELETE FROM documentos WHERE id = ?`, [id]);
+    } catch (e) {
+      const idx = memoryDocuments.findIndex(d => d.id == id);
+      if (idx !== -1) memoryDocuments.splice(idx, 1);
+    }
+    io.to(`assembly_1`).emit('documents:updated');
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -411,7 +492,7 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '1.8.5-sdk' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '2.0.0-full' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -437,7 +518,7 @@ io.on('connection', (socket) => {
       } else if (activeSessions.has(sessionKey)) {
         const existingSession = activeSessions.get(sessionKey);
         if (existingSession.socketId !== socket.id) {
-          io.to(existingSession.socketId).emit('session:invalidated', { message: 'Sesión iniciada desde otro dispositivo.' });
+          io.to(existingSession.socketId).emit('auth:kicked', { message: 'Sesión iniciada desde otro dispositivo.' });
         }
       }
 
@@ -465,6 +546,21 @@ io.on('connection', (socket) => {
     } catch (error) {
       socket.emit('auth:error', 'Error interno al autenticar.');
     }
+  });
+
+  // CHAT EN TIEMPO REAL
+  socket.on('chat:message', ({ texto, emisor, unidad }) => {
+    const targetAssembly = socket.assemblyId || 1;
+    const msgData = {
+      id: Date.now(),
+      texto,
+      emisor: emisor || 'Asistente',
+      unidad: unidad || '---',
+      hora: new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
+    };
+    memoryChat.push(msgData);
+    if (memoryChat.length > 100) memoryChat.shift();
+    io.to(`assembly_${targetAssembly}`).emit('chat:broadcast', msgData);
   });
 
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
@@ -573,4 +669,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v1.8.5-sdk corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v2.0.0-full corriendo en puerto ${PORT}`));
