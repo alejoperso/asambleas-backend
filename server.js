@@ -8,8 +8,8 @@ const db = require('./db');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ limit: '25mb', extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] } });
@@ -17,22 +17,20 @@ const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'P
 const activeQuestions = new Map();
 const timerIntervals = new Map();
 const activeSessions = new Map(); // sessionKey -> { userId, assemblyId, socketId, identificadorUnico }
-const socketUserMap = new Map();  // socketId -> sessionKey
+const socketUserMap = new Map();
 
-// TABLAS AUXILIARES EN MEMORIA PARA FALLBACK
+// BASE DE DATOS AUXILIAR EN MEMORIA EN CASO DE FALLBACK
 const memoryDocuments = [];
 const memoryChat = [];
 const memoryAssemblies = [
   { id: 1, nombre_copropiedad: 'Conjunto Residencial Parque Real', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', admin_user: 'ADMIN01' }
 ];
 
-// HELPER: ENCODER BASE64URL ESTÁNDAR PARA ZOOM JWT
 function toBase64Url(input) {
   const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
   return buf.toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-// HELPER: EXTRAER ID Y CLAVE REAL DE ZOOM
 function parseZoomCredentials(rawUrl, manualPasscode) {
   if (!rawUrl || typeof rawUrl !== 'string') return { meetingId: '', passcode: '' };
   const url = rawUrl.trim();
@@ -42,10 +40,32 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
   return { meetingId, passcode };
 }
 
-// HELPER: PODERES Y COEFICIENTES DETALLADOS
+// VERIFICA SI UN USUARIO HA DELEGADO SU VOTO A UN APODERADO AUTORIZADO
+async function checkUserRepresentedStatus(userId, assemblyId) {
+  try {
+    const [rows] = await db.query(
+      `SELECT p.id, u_ap.nombre_completo AS apoderado_nombre, u_ap.identificador_unico AS apoderado_id
+       FROM poderes p
+       JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
+       WHERE p.otorgante_id = ? AND p.assembly_id = ? AND p.estado = 'autorizado'`,
+      [userId, assemblyId]
+    );
+
+    if (rows.length > 0) {
+      return { isRepresented: true, apoderadoNombre: rows[0].apoderado_nombre, apoderadoId: rows[0].apoderado_id };
+    }
+    return { isRepresented: false, apoderadoNombre: null, apoderadoId: null };
+  } catch (err) {
+    return { isRepresented: false, apoderadoNombre: null, apoderadoId: null };
+  }
+}
+
+// DETALLE DE PODERES Y CÁLCULO DE COEFICIENTE
 async function getUserPowerDetails(userId, assemblyId) {
   try {
-    // Poderes autorizados (suman al coeficiente efectivo)
+    const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
+
+    // Poderes autorizados donde este usuario es APODERADO
     const [aprobados] = await db.query(
       `SELECT p.id AS poder_id, u_ot.identificador_unico, u_ot.nombre_completo, u_ot.unidad, u_ot.coeficiente
        FROM poderes p
@@ -54,9 +74,9 @@ async function getUserPowerDetails(userId, assemblyId) {
       [userId, assemblyId]
     );
 
-    // Poderes pendientes de aprobación por el Representante Legal
+    // Poderes pendientes
     const [pendientes] = await db.query(
-      `SELECT p.id AS poder_id, u_ot.identificador_unico, u_ot.nombre_completo, u_ot.unidad, u_ot.coeficiente, p.created_at
+      `SELECT p.id AS poder_id, u_ot.identificador_unico, u_ot.nombre_completo, u_ot.unidad, u_ot.coeficiente
        FROM poderes p
        JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
        WHERE p.apoderado_id = ? AND p.assembly_id = ? AND p.estado = 'pendiente'`,
@@ -74,20 +94,23 @@ async function getUserPowerDetails(userId, assemblyId) {
       return { id: r.poder_id, identificador: r.identificador_unico, nombre: r.nombre_completo, unidad: r.unidad, coeficiente: parseFloat(r.coeficiente) || 0, estado: 'pendiente' };
     });
 
-    return { coefPoderes, representadosAprobados, representadosPendientes };
+    return { coefPoderes, representadosAprobados, representadosPendientes, isRepresented };
   } catch (err) {
-    return { coefPoderes: 0, representadosAprobados: [], representadosPendientes: [] };
+    return { coefPoderes: 0, representadosAprobados: [], representadosPendientes: [], isRepresented: false };
   }
 }
 
 async function getUserEffectiveCoefficient(userId, assemblyId) {
+  const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
+  // SI EL USUARIO TIENE PODER AUTORIZADO A OTRO, SU COEFICIENTES ES 0 PARA EVITAR VOTO DUPLICADO
+  if (isRepresented) return 0;
+
   const [u] = await db.query(`SELECT coeficiente FROM usuarios WHERE id = ?`, [userId]);
   const propio = u.length > 0 ? parseFloat(u[0].coeficiente) || 0 : 0;
   const { coefPoderes } = await getUserPowerDetails(userId, assemblyId);
   return propio + coefPoderes;
 }
 
-// CÁLCULO Y TRANSMISIÓN EN TIEMPO REAL DEL QUÓRUM DE CONECTADOS
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
     const activeUserIds = new Set();
@@ -109,7 +132,7 @@ async function updateAndBroadcastQuorum(assemblyId) {
     const quorumPercentage = (totalQuorum * 100).toFixed(4);
     io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
   } catch (err) {
-    console.error('Error calculando quórum en tiempo real:', err);
+    console.error('Error calculando quórum:', err);
   }
 }
 
@@ -135,7 +158,21 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// --- REST API: SUPER ADMINISTRADOR ---
+// REST API: ASAMBLEAS ACTIVAS PARA LANDING PAGE
+app.get('/api/assemblies/active', async (req, res) => {
+  try {
+    try {
+      const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url FROM asambleas ORDER BY id DESC`);
+      return res.json({ ok: true, asambleas: rows });
+    } catch (e) {
+      return res.json({ ok: true, asambleas: memoryAssemblies });
+    }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: SUPER ADMINISTRADOR
 app.get('/api/superadmin/assemblies', async (req, res) => {
   try {
     try {
@@ -151,12 +188,13 @@ app.get('/api/superadmin/assemblies', async (req, res) => {
 
 app.post('/api/superadmin/assemblies', async (req, res) => {
   try {
-    const { nombreCopropiedad, logoUrl, adminIdentificador, zoomEmbedUrl, zoomPasscode } = req.body;
+    const { nombreCopropiedad, logoBase64, adminIdentificador, zoomEmbedUrl, zoomPasscode } = req.body;
+    const logoUrl = logoBase64 || 'https://via.placeholder.com/150x40?text=Copropiedad';
     try {
       const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
       const [result] = await db.query(
         `INSERT INTO asambleas (nombre_copropiedad, logo_url, zoom_embed_url, zoom_meeting_id, zoom_passcode) VALUES (?, ?, ?, ?, ?)`,
-        [nombreCopropiedad, logoUrl || 'https://via.placeholder.com/150x40?text=Copropiedad', zoomEmbedUrl || '', parsed.meetingId, parsed.passcode]
+        [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode]
       );
       const assemblyId = result.insertId;
 
@@ -181,7 +219,7 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
 
 app.post('/api/superadmin/assign-role', async (req, res) => {
   try {
-    const { assemblyId, identificadorUnico, nombreCompleto, rol } = req.body; // rol: 'admin' o 'representante_legal'
+    const { assemblyId, identificadorUnico, nombreCompleto, rol } = req.body;
     const targetId = identificadorUnico.trim().toUpperCase();
     await db.query(
       `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
@@ -195,7 +233,7 @@ app.post('/api/superadmin/assign-role', async (req, res) => {
   }
 });
 
-// --- REST API: DATOS Y BRANDING DE ASAMBLEA ---
+// REST API: BRANDING Y DETALLES DE ASAMBLEA
 app.get('/api/assemblies/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -215,86 +253,64 @@ app.get('/api/assemblies/:id', async (req, res) => {
 app.put('/api/assemblies/:id/info', async (req, res) => {
   try {
     const { id } = req.params;
-    const { nombreCopropiedad, logoUrl } = req.body;
-    await db.query(`UPDATE asambleas SET nombre_copropiedad = ?, logo_url = ? WHERE id = ?`, [nombreCopropiedad, logoUrl, id]);
-    io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl });
+    const { nombreCopropiedad, logoBase64 } = req.body;
+    await db.query(`UPDATE asambleas SET nombre_copropiedad = ?, logo_url = ? WHERE id = ?`, [nombreCopropiedad, logoBase64, id]);
+    io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl: logoBase64 });
     res.json({ ok: true, message: 'Información de copropiedad actualizada.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// --- REST API: ZOOM FIRMAS Y CONFIGURACIÓN ---
-app.post('/api/zoom/signature', (req, res) => {
+// REST API: REPOSITORIO DE DOCUMENTOS DESDE EXPLORADOR DE ARCHIVOS
+app.get('/api/documents/:assemblyId', async (req, res) => {
   try {
-    const { meetingNumber, role } = req.body;
-    const sdkKey = process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w';
-    const sdkSecret = process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6';
-
-    if (!sdkKey || !sdkSecret) {
-      return res.status(500).json({ ok: false, error: 'Faltan credenciales de Zoom SDK.' });
+    const { assemblyId } = req.params;
+    try {
+      const [rows] = await db.query(`SELECT id, titulo, archivo_url, created_at FROM documentos WHERE assembly_id = ? ORDER BY created_at DESC`, [assemblyId]);
+      return res.json({ ok: true, documentos: rows });
+    } catch (e) {
+      const docs = memoryDocuments.filter(d => d.assemblyId == assemblyId);
+      return res.json({ ok: true, documentos: docs });
     }
-
-    const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
-    if (!cleanMn || isNaN(cleanMn)) {
-      return res.status(400).json({ ok: false, error: 'ID de reunión de Zoom inválido.' });
-    }
-
-    const iat = Math.floor(Date.now() / 1000) - 30;
-    const exp = iat + 60 * 60 * 2;
-
-    const oHeader = { alg: 'HS256', typ: 'JWT' };
-    const oPayload = { sdkKey, appKey: sdkKey, mn: cleanMn, role: parseInt(role || 0, 10), iat, exp, tokenExp: exp };
-
-    const sHeader = toBase64Url(JSON.stringify(oHeader));
-    const sPayload = toBase64Url(JSON.stringify(oPayload));
-    const dataToSign = `${sHeader}.${sPayload}`;
-    const hmac = crypto.createHmac('sha256', sdkSecret).update(dataToSign).digest();
-    const signature = toBase64Url(hmac);
-    const jwtToken = `${dataToSign}.${signature}`;
-
-    res.json({ ok: true, signature: jwtToken, sdkKey });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.get('/api/assemblies/:id/zoom', async (req, res) => {
+app.post('/api/documents', async (req, res) => {
+  try {
+    const { assemblyId, titulo, archivoBase64 } = req.body;
+    const targetAssembly = assemblyId || 1;
+    try {
+      await db.query(`INSERT INTO documentos (assembly_id, titulo, archivo_url) VALUES (?, ?, ?)`, [targetAssembly, titulo, archivoBase64]);
+    } catch (e) {
+      memoryDocuments.push({ id: Date.now(), assemblyId: targetAssembly, titulo, archivo_url: archivoBase64, created_at: new Date() });
+    }
+    io.to(`assembly_${targetAssembly}`).emit('documents:updated');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/documents/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
-    
-    const parsed = parseZoomCredentials(rows[0].zoom_embed_url, rows[0].zoom_passcode);
-    const meetingId = rows[0].zoom_meeting_id || parsed.meetingId;
-    const passcode = rows[0].zoom_passcode || parsed.passcode;
-
-    res.json({ ok: true, zoom: { rawUrl: rows[0].zoom_embed_url, meetingId, passcode } });
+    try {
+      await db.query(`DELETE FROM documentos WHERE id = ?`, [id]);
+    } catch (e) {
+      const idx = memoryDocuments.findIndex(d => d.id == id);
+      if (idx !== -1) memoryDocuments.splice(idx, 1);
+    }
+    io.to(`assembly_1`).emit('documents:updated');
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.put('/api/assemblies/:id/zoom', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { zoomEmbedUrl, zoomPasscode } = req.body;
-    const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
-
-    await db.query(
-      `UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`,
-      [zoomEmbedUrl, parsed.meetingId, parsed.passcode, id]
-    );
-
-    const streamData = { meetingId: parsed.meetingId, passcode: parsed.passcode, rawUrl: zoomEmbedUrl };
-    io.to(`assembly_${id}`).emit('zoom:updated', { streamInfo: streamData });
-    res.json({ ok: true, message: 'Configuración guardada.', streamInfo: streamData });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// --- REST API: PREGUNTAS (CREACIÓN, EDICIÓN COMPLETA Y ELIMINACIÓN) ---
+// REST API: PREGUNTAS Y OPCIONES
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -373,7 +389,7 @@ app.delete('/api/questions/:id', async (req, res) => {
   }
 });
 
-// --- REST API: APROBACIÓN DE PODERES Y GESTIÓN ---
+// REST API: PODERES Y USUARIOS
 app.get('/api/powers/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -397,7 +413,7 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
 app.put('/api/powers/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
-    const { estado, observaciones } = req.body; // estado: 'autorizado' | 'rechazado'
+    const { estado, observaciones } = req.body;
     const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
     if (p.length === 0) return res.status(404).json({ ok: false, error: 'Poder no encontrado' });
 
@@ -470,22 +486,6 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-app.delete('/api/powers/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
-    await db.query(`DELETE FROM poderes WHERE id = ?`, [id]);
-    if (p.length > 0) {
-      await updateAndBroadcastQuorum(p[0].assembly_id);
-      io.to(`assembly_${p[0].assembly_id}`).emit('powers:updated');
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// --- REST API: USUARIOS, REPOSITORIO Y EXCEL ---
 app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -501,53 +501,6 @@ app.get('/api/users/:assemblyId', async (req, res) => {
     sql += ` ORDER BY unidad ASC LIMIT 50`;
     const [usuarios] = await db.query(sql, params);
     res.json({ ok: true, usuarios });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.get('/api/documents/:assemblyId', async (req, res) => {
-  try {
-    const { assemblyId } = req.params;
-    try {
-      const [rows] = await db.query(`SELECT id, titulo, archivo_url, created_at FROM documentos WHERE assembly_id = ? ORDER BY created_at DESC`, [assemblyId]);
-      return res.json({ ok: true, documentos: rows });
-    } catch (e) {
-      const docs = memoryDocuments.filter(d => d.assemblyId == assemblyId);
-      return res.json({ ok: true, documentos: docs });
-    }
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.post('/api/documents', async (req, res) => {
-  try {
-    const { assemblyId, titulo, archivoUrl } = req.body;
-    const targetAssembly = assemblyId || 1;
-    try {
-      await db.query(`INSERT INTO documentos (assembly_id, titulo, archivo_url) VALUES (?, ?, ?)`, [targetAssembly, titulo, archivoUrl]);
-    } catch (e) {
-      memoryDocuments.push({ id: Date.now(), assemblyId: targetAssembly, titulo, archivo_url: archivoUrl, created_at: new Date() });
-    }
-    io.to(`assembly_${targetAssembly}`).emit('documents:updated');
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.delete('/api/documents/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    try {
-      await db.query(`DELETE FROM documentos WHERE id = ?`, [id]);
-    } catch (e) {
-      const idx = memoryDocuments.findIndex(d => d.id == id);
-      if (idx !== -1) memoryDocuments.splice(idx, 1);
-    }
-    io.to(`assembly_1`).emit('documents:updated');
-    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -582,9 +535,63 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '2.5.0-senior' }));
+// REST API: FIRMAS ZOOM
+app.post('/api/zoom/signature', (req, res) => {
+  try {
+    const { meetingNumber, role } = req.body;
+    const sdkKey = process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w';
+    const sdkSecret = process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6';
 
-// --- WEBSOCKETS CON ACTUALIZACIÓN INMEDIATA AL DESCONECTARSE UN ASISTENTE ---
+    const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
+    if (!cleanMn || isNaN(cleanMn)) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
+
+    const iat = Math.floor(Date.now() / 1000) - 30;
+    const exp = iat + 60 * 60 * 2;
+
+    const oHeader = { alg: 'HS256', typ: 'JWT' };
+    const oPayload = { sdkKey, appKey: sdkKey, mn: cleanMn, role: parseInt(role || 0, 10), iat, exp, tokenExp: exp };
+
+    const sHeader = toBase64Url(JSON.stringify(oHeader));
+    const sPayload = toBase64Url(JSON.stringify(oPayload));
+    const dataToSign = `${sHeader}.${sPayload}`;
+    const hmac = crypto.createHmac('sha256', sdkSecret).update(dataToSign).digest();
+    const signature = toBase64Url(hmac);
+
+    res.json({ ok: true, signature: `${dataToSign}.${signature}`, sdkKey });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/assemblies/:id/zoom', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
+    const parsed = parseZoomCredentials(rows[0].zoom_embed_url, rows[0].zoom_passcode);
+    res.json({ ok: true, zoom: { rawUrl: rows[0].zoom_embed_url, meetingId: rows[0].zoom_meeting_id || parsed.meetingId, passcode: rows[0].zoom_passcode || parsed.passcode } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.put('/api/assemblies/:id/zoom', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { zoomEmbedUrl, zoomPasscode } = req.body;
+    const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
+    await db.query(`UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`, [zoomEmbedUrl, parsed.meetingId, parsed.passcode, id]);
+    const streamData = { meetingId: parsed.meetingId, passcode: parsed.passcode, rawUrl: zoomEmbedUrl };
+    io.to(`assembly_${id}`).emit('zoom:updated', { streamInfo: streamData });
+    res.json({ ok: true, message: 'Zoom actualizado.', streamInfo: streamData });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.0.0-master' }));
+
+// WEBSOCKETS EN TIEMPO REAL CON VALIDACIÓN ESTRICTA DE DUPLICADOS DE VOTO Y DESCONEXIÓN
 io.on('connection', (socket) => {
 
   socket.on('auth:join', async ({ assemblyId, identificadorUnico }) => {
@@ -603,11 +610,10 @@ io.on('connection', (socket) => {
       const userId = user.id;
       const sessionKey = `${targetAssembly}_${userId}`;
 
-      // CONTROL DE SESIÓN ÚNICA: EXPULSAR SESIÓN DUPLICADA SI SE INICIA DESDE OTRO NAVEGADOR
       if (activeSessions.has(sessionKey)) {
         const existingSession = activeSessions.get(sessionKey);
         if (existingSession.socketId !== socket.id) {
-          io.to(existingSession.socketId).emit('auth:kicked', { message: 'Tu sesión ha sido abierta desde otro dispositivo.' });
+          io.to(existingSession.socketId).emit('auth:kicked', { message: 'Tu sesión ha sido iniciada en otro dispositivo.' });
         }
       }
 
@@ -621,17 +627,15 @@ io.on('connection', (socket) => {
       const roomName = `assembly_${targetAssembly}`;
       socket.join(roomName);
 
-      // DESGLOSE DE COEFICIENTES Y PODERES (PROPIO, PODERES Y SUMATORIA EFECTIVA)
-      const { coefPoderes, representadosAprobados, representadosPendientes } = await getUserPowerDetails(userId, targetAssembly);
+      const { coefPoderes, representadosAprobados, representadosPendientes, isRepresented } = await getUserPowerDetails(userId, targetAssembly);
       user.coeficientePropio = parseFloat(user.coeficiente) || 0;
       user.coeficientePoderes = coefPoderes;
-      user.coeficienteEfectivo = user.coeficientePropio + coefPoderes;
+      user.coeficienteEfectivo = isRepresented ? 0 : (user.coeficientePropio + coefPoderes);
+      user.isRepresented = isRepresented;
       user.poderesAprobados = representadosAprobados;
       user.poderesPendientes = representadosPendientes;
 
       socket.emit('auth:success', { user, room: roomName });
-      
-      // RECALCULAR Y NOTIFICAR QUÓRUM INMEDIATAMENTE A TODOS LOS CONECTADOS
       await updateAndBroadcastQuorum(targetAssembly);
 
       if (activeQuestions.has(targetAssembly)) {
@@ -640,7 +644,7 @@ io.on('connection', (socket) => {
         socket.emit('voting:current_state', { ...activeQ, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
       }
     } catch (error) {
-      socket.emit('auth:error', 'Error interno al autenticar.');
+      socket.emit('auth:error', 'Error al autenticar.');
     }
   });
 
@@ -723,6 +727,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // BLOQUEO ABSOLUTO DE VOTO PARA USUARIOS REPRESENTADOS
   socket.on('vote:submit', async ({ opcionId }) => {
     const { assemblyId, userId } = socket;
     if (!assemblyId || !userId) return;
@@ -731,7 +736,16 @@ io.on('connection', (socket) => {
     if (!currentQ || !currentQ.isOpen) return;
 
     try {
+      const { isRepresented, apoderadoNombre } = await checkUserRepresentedStatus(userId, assemblyId);
+      if (isRepresented) {
+        return socket.emit('vote:rejected', { message: `No puedes votar directamente. Tus derechos de voto están delegados por poder autorizado a ${apoderadoNombre}.` });
+      }
+
       const efCoef = await getUserEffectiveCoefficient(userId, assemblyId);
+      if (efCoef <= 0) {
+        return socket.emit('vote:rejected', { message: 'Tu coeficiente habilitado de voto es 0.0000%.' });
+      }
+
       await db.query(
         `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
          VALUES (?, ?, ?, ?, ?)
@@ -746,7 +760,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // AL DESCONECTARSE: REMOVER INMEDIATAMENTE DE ACTIVOS Y RECALCULAR QUÓRUM DE CONECTADOS
+  // ACTUALIZACIÓN INMEDIATA DEL QUÓRUM CUANDO CUALQUIER NAVEGADOR O PESTAÑA SE DESCONECTA
   socket.on('disconnect', async () => {
     if (socket.sessionKey && activeSessions.has(socket.sessionKey)) {
       const sessionData = activeSessions.get(socket.sessionKey);
@@ -759,14 +773,5 @@ io.on('connection', (socket) => {
   });
 });
 
-// INTERVALO DE SINCRONIZACIÓN DE SEGURIDAD PARA EL QUÓRUM CADA 10 SEGUNDOS
-setInterval(() => {
-  const assemblies = new Set();
-  for (const s of activeSessions.values()) {
-    if (s.assemblyId) assemblies.add(s.assemblyId);
-  }
-  assemblies.forEach(assId => updateAndBroadcastQuorum(assId));
-}, 10000);
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v2.5.0-senior corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.0.0-master corriendo en puerto ${PORT}`));
