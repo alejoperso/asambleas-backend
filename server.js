@@ -264,6 +264,48 @@ app.post('/api/superadmin/assign-role', async (req, res) => {
   }
 });
 
+// REST API: CARGA MASIVA DE PADRÓN ELECTORAL (ASISTENTES VÍA EXCEL / CSV)
+app.post('/api/superadmin/users/bulk', async (req, res) => {
+  try {
+    const { assemblyId, users } = req.body;
+    if (!assemblyId || !Array.isArray(users) || users.length === 0) {
+      return res.status(400).json({ ok: false, error: 'Asamblea inválida o lista de usuarios vacía.' });
+    }
+
+    let count = 0;
+    for (const u of users) {
+      const idUnico = (u.identificadorUnico || u.identificador_unico || u.ID || u.id || u.Identificador || '').toString().trim().toUpperCase();
+      const nombre = (u.nombreCompleto || u.nombre_completo || u.Nombre || u.nombre || '').toString().trim();
+      const unidad = (u.unidad || u.Unidad || u.apto || u.Apto || u.Torre || '---').toString().trim();
+      const email = (u.email || u.Email || '').toString().trim();
+      
+      let coefRaw = u.coeficiente !== undefined ? u.coeficiente : u.Coeficiente;
+      let coef = parseFloat(coefRaw);
+      if (isNaN(coef)) coef = 0.00000;
+
+      if (!idUnico) continue;
+
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol)
+         VALUES (?, ?, ?, ?, ?, ?, 'asistente')
+         ON DUPLICATE KEY UPDATE 
+           nombre_completo = VALUES(nombre_completo),
+           unidad = VALUES(unidad),
+           email = VALUES(email),
+           coeficiente = VALUES(coeficiente)`,
+        [assemblyId, idUnico, nombre || idUnico, unidad, email, coef]
+      );
+      count++;
+    }
+
+    io.to(`assembly_${assemblyId}`).emit('users:updated');
+    return res.json({ ok: true, count, message: `Se cargaron ${count} asistentes con éxito.` });
+  } catch (err) {
+    console.error('Error en carga masiva:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // REST API: BRANDING Y DETALLES DE ASAMBLEA
 app.get('/api/assemblies/:id', async (req, res) => {
   try {
