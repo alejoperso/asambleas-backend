@@ -131,7 +131,8 @@ async function updateAndBroadcastQuorum(assemblyId) {
     for (let uId of activeUserIds) {
       totalQuorum += await getUserEffectiveCoefficient(uId, assemblyId);
     }
-    const quorumPercentage = (totalQuorum * 100).toFixed(4);
+    // CORRECCIÓN: Los coeficientes en la BD ya se encuentran en escala base 100
+    const quorumPercentage = totalQuorum.toFixed(4);
     io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
   } catch (err) {
     console.error('Error calculando quórum:', err);
@@ -595,7 +596,8 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
 
     let csvContent = "\uFEFFPregunta;ID Votante;Nombre;Unidad;Opción Votada;Coeficiente Aplicado (%);Fecha y Hora\n";
     votos.forEach(v => {
-      const coefPct = (parseFloat(v.Coeficiente_Efectivo) * 100).toFixed(4);
+      // CORRECCIÓN: Los coeficientes en la BD ya se encuentran en escala base 100
+      const coefPct = parseFloat(v.Coeficiente_Efectivo).toFixed(4);
       const fecha = new Date(v.Fecha_Hora_Voto).toLocaleString('es-CO');
       csvContent += `"${v.Pregunta}";"${v.ID_Votante}";"${v.Nombre}";"${v.Unidad}";"${v.Opcion_Votada}";"${coefPct}%";"${fecha}"\n`;
     });
