@@ -563,7 +563,7 @@ app.post('/api/powers', async (req, res) => {
 app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
-    const { search } = req.query;
+    const { search, all } = req.query;
     let sql = `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol FROM usuarios WHERE assembly_id = ?`;
     let params = [assemblyId];
 
@@ -572,7 +572,10 @@ app.get('/api/users/:assemblyId', async (req, res) => {
       const term = `%${search.toUpperCase()}%`;
       params.push(term, term, term);
     }
-    sql += ` ORDER BY unidad ASC LIMIT 50`;
+    sql += ` ORDER BY unidad ASC`;
+    if (all !== 'true') {
+      sql += ` LIMIT 50`;
+    }
     const [usuarios] = await db.query(sql, params);
     res.json({ ok: true, usuarios });
   } catch (err) {
