@@ -5,7 +5,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const db = require('./db');
 
 const app = express();
@@ -16,21 +16,16 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] } });
 
+// INICIALIZACIÓN DE RESEND CON API KEY
+const resend = new Resend(process.env.RESEND_API_KEY || 're_dummy_key');
+
 const activeQuestions = new Map();
 const timerIntervals = new Map();
 const activeSessions = new Map(); // sessionKey -> { userId, assemblyId, socketId, identificadorUnico }
 const socketUserMap = new Map();
 
-// CONFIGURACIÓN DEL TRANSPORTE SMTP PARA ENVÍO DE CORREOS
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: process.env.SMTP_SECURE === 'true',
-  auth: {
-    user: process.env.SMTP_USER || '',
-    pass: process.env.SMTP_PASS || ''
-  }
-});
+// RETARDO PARA CONTROL DE FRECUENCIA (RESEND LIMIT: 2 CORREOS / SEGUNDO EN FREE TIER)
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // GENERADOR DE CONTRASEÑA ALFANUMÉRICA
 function generateAlphanumericPassword(length = 8) {
@@ -326,7 +321,7 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
-// REST API: GENERAR Y ENVIAR CREDENCIALES ALFANUMÉRICAS POR CORREO
+// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK CON PACING
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -345,6 +340,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
     }
 
     const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
+    const fromSender = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
     let sentCount = 0;
     let errorCount = 0;
 
@@ -355,55 +351,63 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
 
       await db.query(`UPDATE usuarios SET password = ? WHERE id = ?`, [hashedPassword, user.id]);
 
-      const mailOptions = {
-        from: `"${nombreCopropiedad}" <${process.env.SMTP_FROM || process.env.SMTP_USER || 'soporte@ajaudiovisual.com'}>`,
-        to: user.email,
-        subject: `Credenciales de Acceso - ${nombreCopropiedad}`,
-        html: `
-          <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
-            <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a la Asamblea Virtual</h2>
-            <p style="font-size: 14px; line-height: 1.6;">Estimado(a) <strong>${user.nombre_completo}</strong> (${user.unidad}),</p>
-            <p style="font-size: 14px; line-height: 1.6;">Le compartimos sus credenciales individuales para ingresar a la <strong>${nombreCopropiedad}</strong>.</p>
-            
-            <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
-              <p style="margin: 6px 0; font-size: 14px;"><strong>URL de Ingreso:</strong> <a href="${clientUrl}?asamblea=${assemblyId}" style="color: #38bdf8; word-break: break-all;">${clientUrl}?asamblea=${assemblyId}</a></p>
-              <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
-              <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
-            </div>
-
-            <h3 style="color: #cbd5e1; font-size: 15px; margin-top: 20px;">Instrucciones Básicas de Ingreso:</h3>
-            <ol style="font-size: 13px; color: #94a3b8; line-height: 1.8; padding-left: 20px;">
-              <li>Haga clic en el enlace provisto o abra la dirección desde su navegador preferido (Google Chrome o Safari).</li>
-              <li>Ingrese su correo electrónico y la contraseña alfanumérica indicada en este correo.</li>
-              <li>Mantenga activa su sesión desde un único dispositivo a la vez.</li>
-              <li>Si representa a otros inmuebles mediante poder autorizado, el sistema sumará automáticamente sus coeficientes.</li>
-            </ol>
-
-            <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
-              Mensaje automático del Sistema de Asambleas Virtuales.
-            </p>
-          </div>
-        `
-      };
-
       try {
-        await transporter.sendMail(mailOptions);
-        sentCount++;
+        const emailResult = await resend.emails.send({
+          from: `${nombreCopropiedad} <${fromSender}>`,
+          to: [user.email],
+          subject: `Credenciales de Acceso - ${nombreCopropiedad}`,
+          text: `Estimado(a) ${user.nombre_completo} (${user.unidad}), tus credenciales de acceso para la ${nombreCopropiedad} son: URL: ${clientUrl}?asamblea=${assemblyId} | Usuario: ${user.email} | Contraseña: ${plainPassword}`,
+          html: `
+            <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
+              <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a la Asamblea Virtual</h2>
+              <p style="font-size: 14px; line-height: 1.6;">Estimado(a) <strong>${user.nombre_completo}</strong> (${user.unidad}),</p>
+              <p style="font-size: 14px; line-height: 1.6;">Le compartimos sus credenciales individuales para ingresar a la <strong>${nombreCopropiedad}</strong>.</p>
+              
+              <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
+                <p style="margin: 6px 0; font-size: 14px;"><strong>URL de Ingreso:</strong> <a href="${clientUrl}?asamblea=${assemblyId}" style="color: #38bdf8; word-break: break-all;">${clientUrl}?asamblea=${assemblyId}</a></p>
+                <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
+                <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
+              </div>
+
+              <h3 style="color: #cbd5e1; font-size: 15px; margin-top: 20px;">Instrucciones Básicas de Ingreso:</h3>
+              <ol style="font-size: 13px; color: #94a3b8; line-height: 1.8; padding-left: 20px;">
+                <li>Haga clic en el enlace provisto o abra la dirección desde su navegador preferido (Google Chrome o Safari).</li>
+                <li>Ingrese su correo electrónico y la contraseña alfanumérica indicada en este correo.</li>
+                <li>Mantenga activa su sesión desde un único dispositivo a la vez.</li>
+                <li>Si representa a otros inmuebles mediante poder autorizado, el sistema sumará automáticamente sus coeficientes.</li>
+              </ol>
+
+              <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
+                Mensaje automático del Sistema de Asambleas Virtuales.
+              </p>
+            </div>
+          `
+        });
+
+        if (emailResult.error) {
+          console.error(`Error Resend al enviar a ${user.email}:`, emailResult.error);
+          errorCount++;
+        } else {
+          sentCount++;
+        }
       } catch (sendErr) {
-        console.error(`Error enviando correo a ${user.email}:`, sendErr);
+        console.error(`Error de excepción enviando correo a ${user.email}:`, sendErr);
         errorCount++;
       }
+
+      // RETARDO DE 600 MS PARA CUMPLIR CON EL LÍMITE DE 2 CORREOS/SEG DE RESEND
+      await sleep(600);
     }
 
     return res.json({
       ok: true,
-      message: `Credenciales generadas y enviadas con éxito. Enviados: ${sentCount}, Fallidos: ${errorCount}.`,
+      message: `Proceso completado con Resend. Enviados: ${sentCount}, Fallidos: ${errorCount}.`,
       sentCount,
       errorCount
     });
 
   } catch (err) {
-    console.error('Error enviando credenciales:', err);
+    console.error('Error general enviando credenciales:', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -786,7 +790,6 @@ io.on('connection', (socket) => {
         [targetAssembly, targetEmail || targetId.toLowerCase(), targetId]
       );
 
-      // SOPORTE DINÁMICO EN CASO DE CÓDIGO DE SOPORTE
       if (rows.length === 0 && targetId.startsWith('SOPORTE')) {
         const [ins] = await db.query(
           `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
@@ -800,7 +803,6 @@ io.on('connection', (socket) => {
 
       const user = rows[0];
 
-      // VALIDACIÓN DE CONTRASEÑA CIFRADA CON BCRYPT (SI SE REGISTRÓ CONTRASEÑA)
       if (user.password && user.password.trim() !== '' && user.rol === 'asistente') {
         if (!targetPassword) {
           return socket.emit('auth:error', 'Ingresa tu contraseña.');
