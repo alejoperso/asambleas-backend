@@ -1,7 +1,7 @@
 {
   "name": "asambleas-backend",
   "version": "3.0.0",
-  "description": "Backend para Sistema de Asambleas Virtuales",
+  "description": "Backend para Sistema de Asambleas Virtuales de Propiedad Horizontal",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,7 +12,7 @@
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
     "mysql2": "^3.0.0",
-    "nodemailer": "^6.9.0",
+    "resend": "^3.2.0",
     "socket.io": "^4.7.5"
   }
 }
