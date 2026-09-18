@@ -4,6 +4,8 @@ const http = require('http');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
+const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
 const db = require('./db');
 
 const app = express();
@@ -18,6 +20,27 @@ const activeQuestions = new Map();
 const timerIntervals = new Map();
 const activeSessions = new Map(); // sessionKey -> { userId, assemblyId, socketId, identificadorUnico }
 const socketUserMap = new Map();
+
+// CONFIGURACIÓN DEL TRANSPORTE SMTP PARA ENVÍO DE CORREOS
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: process.env.SMTP_SECURE === 'true',
+  auth: {
+    user: process.env.SMTP_USER || '',
+    pass: process.env.SMTP_PASS || ''
+  }
+});
+
+// GENERADOR DE CONTRASEÑA ALFANUMÉRICA
+function generateAlphanumericPassword(length = 8) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  let password = '';
+  for (let i = 0; i < length; i++) {
+    password += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return password;
+}
 
 // BASE DE DATOS AUXILIAR EN MEMORIA EN CASO DE FALLBACK
 const memoryDocuments = [];
@@ -65,7 +88,6 @@ async function getUserPowerDetails(userId, assemblyId) {
   try {
     const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
 
-    // Poderes autorizados donde este usuario es APODERADO
     const [aprobados] = await db.query(
       `SELECT p.id AS poder_id, u_ot.identificador_unico, u_ot.nombre_completo, u_ot.unidad, u_ot.coeficiente
        FROM poderes p
@@ -74,7 +96,6 @@ async function getUserPowerDetails(userId, assemblyId) {
       [userId, assemblyId]
     );
 
-    // Poderes pendientes
     const [pendientes] = await db.query(
       `SELECT p.id AS poder_id, u_ot.identificador_unico, u_ot.nombre_completo, u_ot.unidad, u_ot.coeficiente
        FROM poderes p
@@ -131,7 +152,6 @@ async function updateAndBroadcastQuorum(assemblyId) {
     for (let uId of activeUserIds) {
       totalQuorum += await getUserEffectiveCoefficient(uId, assemblyId);
     }
-    // CORRECCIÓN: Los coeficientes en la BD ya se encuentran en escala base 100
     const quorumPercentage = totalQuorum.toFixed(4);
     io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
   } catch (err) {
@@ -217,7 +237,6 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     const logoUrl = logoBase64 || 'https://via.placeholder.com/150x40?text=Copropiedad';
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
 
-    // Se incluye fecha_evento (NOW()) para cumplir la restricción NOT NULL de la tabla asambleas
     const [result] = await db.query(
       `INSERT INTO asambleas (nombre_copropiedad, logo_url, fecha_evento, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
        VALUES (?, ?, NOW(), 'programada', ?, ?, ?, ?)`,
@@ -265,7 +284,7 @@ app.post('/api/superadmin/assign-role', async (req, res) => {
   }
 });
 
-// REST API: CARGA MASIVA DE PADRÓN ELECTORAL (ASISTENTES VÍA EXCEL / CSV)
+// REST API: CARGA MASIVA DE PADRÓN ELECTORAL
 app.post('/api/superadmin/users/bulk', async (req, res) => {
   try {
     const { assemblyId, users } = req.body;
@@ -275,16 +294,16 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
 
     let count = 0;
     for (const u of users) {
-      const idUnico = (u.identificadorUnico || u.identificador_unico || u.ID || u.id || u.Identificador || '').toString().trim().toUpperCase();
+      const email = (u.email || u.Email || u.Correo || u.correo || '').toString().trim().toLowerCase();
+      const idUnico = (u.identificadorUnico || u.identificador_unico || u.ID || u.id || u.Identificador || email).toString().trim().toUpperCase();
       const nombre = (u.nombreCompleto || u.nombre_completo || u.Nombre || u.nombre || '').toString().trim();
       const unidad = (u.unidad || u.Unidad || u.apto || u.Apto || u.Torre || '---').toString().trim();
-      const email = (u.email || u.Email || '').toString().trim();
       
       let coefRaw = u.coeficiente !== undefined ? u.coeficiente : u.Coeficiente;
       let coef = parseFloat(coefRaw);
       if (isNaN(coef)) coef = 0.00000;
 
-      if (!idUnico) continue;
+      if (!idUnico && !email) continue;
 
       await db.query(
         `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol)
@@ -303,6 +322,88 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
     return res.json({ ok: true, count, message: `Se cargaron ${count} asistentes con éxito.` });
   } catch (err) {
     console.error('Error en carga masiva:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: GENERAR Y ENVIAR CREDENCIALES ALFANUMÉRICAS POR CORREO
+app.post('/api/superadmin/send-credentials', async (req, res) => {
+  try {
+    const { assemblyId } = req.body;
+    if (!assemblyId) return res.status(400).json({ ok: false, error: 'Asamblea requerida.' });
+
+    const [asamblea] = await db.query(`SELECT nombre_copropiedad FROM asambleas WHERE id = ?`, [assemblyId]);
+    const nombreCopropiedad = asamblea.length > 0 ? asamblea[0].nombre_copropiedad : 'Asamblea Virtual';
+
+    const [usuarios] = await db.query(
+      `SELECT id, identificador_unico, nombre_completo, email, unidad FROM usuarios WHERE assembly_id = ? AND email IS NOT NULL AND email != '' AND rol = 'asistente'`,
+      [assemblyId]
+    );
+
+    if (usuarios.length === 0) {
+      return res.status(400).json({ ok: false, error: 'No se encontraron usuarios con correo electrónico registrado.' });
+    }
+
+    const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
+    let sentCount = 0;
+    let errorCount = 0;
+
+    for (const user of usuarios) {
+      const plainPassword = generateAlphanumericPassword(8);
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(plainPassword, salt);
+
+      await db.query(`UPDATE usuarios SET password = ? WHERE id = ?`, [hashedPassword, user.id]);
+
+      const mailOptions = {
+        from: `"${nombreCopropiedad}" <${process.env.SMTP_FROM || process.env.SMTP_USER || 'soporte@ajaudiovisual.com'}>`,
+        to: user.email,
+        subject: `Credenciales de Acceso - ${nombreCopropiedad}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
+            <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a la Asamblea Virtual</h2>
+            <p style="font-size: 14px; line-height: 1.6;">Estimado(a) <strong>${user.nombre_completo}</strong> (${user.unidad}),</p>
+            <p style="font-size: 14px; line-height: 1.6;">Le compartimos sus credenciales individuales para ingresar a la <strong>${nombreCopropiedad}</strong>.</p>
+            
+            <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
+              <p style="margin: 6px 0; font-size: 14px;"><strong>URL de Ingreso:</strong> <a href="${clientUrl}?asamblea=${assemblyId}" style="color: #38bdf8; word-break: break-all;">${clientUrl}?asamblea=${assemblyId}</a></p>
+              <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
+              <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
+            </div>
+
+            <h3 style="color: #cbd5e1; font-size: 15px; margin-top: 20px;">Instrucciones Básicas de Ingreso:</h3>
+            <ol style="font-size: 13px; color: #94a3b8; line-height: 1.8; padding-left: 20px;">
+              <li>Haga clic en el enlace provisto o abra la dirección desde su navegador preferido (Google Chrome o Safari).</li>
+              <li>Ingrese su correo electrónico y la contraseña alfanumérica indicada en este correo.</li>
+              <li>Mantenga activa su sesión desde un único dispositivo a la vez.</li>
+              <li>Si representa a otros inmuebles mediante poder autorizado, el sistema sumará automáticamente sus coeficientes.</li>
+            </ol>
+
+            <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
+              Mensaje automático del Sistema de Asambleas Virtuales.
+            </p>
+          </div>
+        `
+      };
+
+      try {
+        await transporter.sendMail(mailOptions);
+        sentCount++;
+      } catch (sendErr) {
+        console.error(`Error enviando correo a ${user.email}:`, sendErr);
+        errorCount++;
+      }
+    }
+
+    return res.json({
+      ok: true,
+      message: `Credenciales generadas y enviadas con éxito. Enviados: ${sentCount}, Fallidos: ${errorCount}.`,
+      sentCount,
+      errorCount
+    });
+
+  } catch (err) {
+    console.error('Error enviando credenciales:', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -336,7 +437,7 @@ app.put('/api/assemblies/:id/info', async (req, res) => {
   }
 });
 
-// REST API: REPOSITORIO DE DOCUMENTOS DESDE EXPLORADOR DE ARCHIVOS
+// REST API: REPOSITORIO DE DOCUMENTOS
 app.get('/api/documents/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -564,13 +665,13 @@ app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
     const { search, all } = req.query;
-    let sql = `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol FROM usuarios WHERE assembly_id = ?`;
+    let sql = `SELECT id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol FROM usuarios WHERE assembly_id = ?`;
     let params = [assemblyId];
 
     if (search) {
-      sql += ` AND (UPPER(identificador_unico) LIKE ? OR UPPER(nombre_completo) LIKE ? OR UPPER(unidad) LIKE ?)`;
+      sql += ` AND (UPPER(identificador_unico) LIKE ? OR UPPER(nombre_completo) LIKE ? OR UPPER(unidad) LIKE ? OR UPPER(email) LIKE ?)`;
       const term = `%${search.toUpperCase()}%`;
-      params.push(term, term, term);
+      params.push(term, term, term, term);
     }
     sql += ` ORDER BY unidad ASC`;
     if (all !== 'true') {
@@ -599,7 +700,6 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
 
     let csvContent = "\uFEFFPregunta;ID Votante;Nombre;Unidad;Opción Votada;Coeficiente Aplicado (%);Fecha y Hora\n";
     votos.forEach(v => {
-      // CORRECCIÓN: Los coeficientes en la BD ya se encuentran en escala base 100
       const coefPct = parseFloat(v.Coeficiente_Efectivo).toFixed(4);
       const fecha = new Date(v.Fecha_Hora_Voto).toLocaleString('es-CO');
       csvContent += `"${v.Pregunta}";"${v.ID_Votante}";"${v.Nombre}";"${v.Unidad}";"${v.Opcion_Votada}";"${coefPct}%";"${fecha}"\n`;
@@ -669,20 +769,24 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
 
 app.get('/', (req, res) => res.json({ status: 'online', version: '3.0.0-master' }));
 
-// WEBSOCKETS EN TIEMPO REAL CON VALIDACIÓN ESTRICTA DE DUPLICADOS DE VOTO Y DESCONEXIÓN
+// WEBSOCKETS EN TIEMPO REAL CON VALIDACIÓN DE CONTRASEÑA Y USUARIO
 io.on('connection', (socket) => {
 
-  socket.on('auth:join', async ({ assemblyId, identificadorUnico }) => {
+  socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password }) => {
     try {
       const targetAssembly = parseInt(assemblyId) || 1;
       const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
+      const targetEmail = (email || '').toString().trim().toLowerCase();
+      const targetPassword = (password || '').toString().trim();
 
       let [rows] = await db.query(
-        `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, rol FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-        [targetAssembly, targetId]
+        `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol 
+         FROM usuarios 
+         WHERE assembly_id = ? AND (LOWER(email) = ? OR UPPER(identificador_unico) = ?)`,
+        [targetAssembly, targetEmail || targetId.toLowerCase(), targetId]
       );
 
-      // SOPORTE DINÁMICO EN CASO DE INGRESAR CON CÓDIGO DE SOPORTE SINO EXISTÍA
+      // SOPORTE DINÁMICO EN CASO DE CÓDIGO DE SOPORTE
       if (rows.length === 0 && targetId.startsWith('SOPORTE')) {
         const [ins] = await db.query(
           `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
@@ -692,9 +796,21 @@ io.on('connection', (socket) => {
         rows = [{ id: ins.insertId, identificador_unico: targetId, nombre_completo: 'Soporte Técnico', unidad: 'SOPORTE', coeficiente: 0.00000, rol: 'soporte' }];
       }
 
-      if (rows.length === 0) return socket.emit('auth:error', 'Identificador no registrado.');
+      if (rows.length === 0) return socket.emit('auth:error', 'Usuario o correo no registrado.');
 
       const user = rows[0];
+
+      // VALIDACIÓN DE CONTRASEÑA CIFRADA CON BCRYPT (SI SE REGISTRÓ CONTRASEÑA)
+      if (user.password && user.password.trim() !== '' && user.rol === 'asistente') {
+        if (!targetPassword) {
+          return socket.emit('auth:error', 'Ingresa tu contraseña.');
+        }
+        const isMatch = await bcrypt.compare(targetPassword, user.password);
+        if (!isMatch) {
+          return socket.emit('auth:error', 'Contraseña incorrecta.');
+        }
+      }
+
       const userId = user.id;
       const sessionKey = `${targetAssembly}_${userId}`;
 
@@ -705,7 +821,7 @@ io.on('connection', (socket) => {
         }
       }
 
-      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: targetId });
+      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: user.identificador_unico });
       socketUserMap.set(socket.id, sessionKey);
 
       socket.sessionKey = sessionKey;
@@ -732,7 +848,8 @@ io.on('connection', (socket) => {
         socket.emit('voting:current_state', { ...activeQ, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
       }
     } catch (error) {
-      socket.emit('auth:error', 'Error al autenticar.');
+      console.error('Error al autenticar socket:', error);
+      socket.emit('auth:error', 'Error interno al autenticar.');
     }
   });
 
@@ -815,7 +932,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // BLOQUEO ABSOLUTO DE VOTO PARA USUARIOS REPRESENTADOS O SOPORTE
   socket.on('vote:submit', async ({ opcionId }) => {
     const { assemblyId, userId } = socket;
     if (!assemblyId || !userId) return;
@@ -848,7 +964,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ACTUALIZACIÓN INMEDIATA DEL QUÓRUM CUANDO CUALQUIER NAVEGADOR O PESTAÑA SE DESCONECTA
   socket.on('disconnect', async () => {
     if (socket.sessionKey && activeSessions.has(socket.sessionKey)) {
       const sessionData = activeSessions.get(socket.sessionKey);
