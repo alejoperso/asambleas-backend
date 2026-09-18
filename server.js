@@ -321,7 +321,7 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
-// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK CON PACING
+// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK CON PACING MASIVO
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -340,7 +340,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
     }
 
     const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
-    const fromSender = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+    const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
     let sentCount = 0;
     let errorCount = 0;
 
@@ -408,6 +408,90 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
 
   } catch (err) {
     console.error('Error general enviando credenciales:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: GENERAR, ACTUALIZAR Y ENVIAR CREDENCIAL A UN SOLO USUARIO INDIVIDUAL
+app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
+  try {
+    const { userId, customPassword } = req.body;
+    if (!userId) return res.status(400).json({ ok: false, error: 'ID de usuario requerido.' });
+
+    const [usuarios] = await db.query(
+      `SELECT u.id, u.identificador_unico, u.nombre_completo, u.email, u.unidad, u.assembly_id, a.nombre_copropiedad 
+       FROM usuarios u 
+       JOIN asambleas a ON u.assembly_id = a.id 
+       WHERE u.id = ?`,
+      [userId]
+    );
+
+    if (usuarios.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Usuario no encontrado.' });
+    }
+
+    const user = usuarios[0];
+
+    if (!user.email || user.email.trim() === '') {
+      return res.status(400).json({ ok: false, error: 'El usuario no tiene un correo electrónico registrado.' });
+    }
+
+    const plainPassword = (customPassword && customPassword.trim() !== '') 
+      ? customPassword.trim() 
+      : generateAlphanumericPassword(8);
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(plainPassword, salt);
+
+    await db.query(`UPDATE usuarios SET password = ? WHERE id = ?`, [hashedPassword, user.id]);
+
+    const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
+    const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
+
+    const emailResult = await resend.emails.send({
+      from: `${user.nombre_copropiedad} <${fromSender}>`,
+      to: [user.email],
+      subject: `Credenciales de Acceso - ${user.nombre_copropiedad}`,
+      text: `Estimado(a) ${user.nombre_completo} (${user.unidad}), tus credenciales de acceso para la ${user.nombre_copropiedad} son: URL: ${clientUrl}?asamblea=${user.assembly_id} | Usuario: ${user.email} | Contraseña: ${plainPassword}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
+          <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a la Asamblea Virtual</h2>
+          <p style="font-size: 14px; line-height: 1.6;">Estimado(a) <strong>${user.nombre_completo}</strong> (${user.unidad}),</p>
+          <p style="font-size: 14px; line-height: 1.6;">Le compartimos sus credenciales individuales para ingresar a la <strong>${user.nombre_copropiedad}</strong>.</p>
+          
+          <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
+            <p style="margin: 6px 0; font-size: 14px;"><strong>URL de Ingreso:</strong> <a href="${clientUrl}?asamblea=${user.assembly_id}" style="color: #38bdf8; word-break: break-all;">${clientUrl}?asamblea=${user.assembly_id}</a></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
+          </div>
+
+          <h3 style="color: #cbd5e1; font-size: 15px; margin-top: 20px;">Instrucciones Básicas de Ingreso:</h3>
+          <ol style="font-size: 13px; color: #94a3b8; line-height: 1.8; padding-left: 20px;">
+            <li>Haga clic en el enlace provisto o abra la dirección desde su navegador preferido (Google Chrome o Safari).</li>
+            <li>Ingrese su correo electrónico y la contraseña alfanumérica indicada en este correo.</li>
+            <li>Mantenga activa su sesión desde un único dispositivo a la vez.</li>
+            <li>Si representa a otros inmuebles mediante poder autorizado, el sistema sumará automáticamente sus coeficientes.</li>
+          </ol>
+
+          <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
+            Mensaje automático del Sistema de Asambleas Virtuales.
+          </p>
+        </div>
+      `
+    });
+
+    if (emailResult.error) {
+      return res.status(500).json({ ok: false, error: emailResult.error.message });
+    }
+
+    return res.json({
+      ok: true,
+      message: `Credenciales enviadas a ${user.email}.`,
+      plainPassword: plainPassword
+    });
+
+  } catch (err) {
+    console.error('Error enviando credencial individual:', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
