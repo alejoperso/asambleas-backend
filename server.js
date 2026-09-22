@@ -259,7 +259,42 @@ app.post('/api/assemblies/:id/close', async (req, res) => {
   }
 });
 
-// REST API: DEPURAR ASAMBLEA (BORRAR VOTOS Y REINICIAR ESTADO PARA PRUEBAS)
+// REST API SUPERADMIN: ELIMINACIÓN DEFINITIVA DE ASAMBLEA EN CASCADA
+app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const targetAssembly = parseInt(id);
+
+    // Detener cronómetros activos
+    if (activeQuestions.has(targetAssembly)) {
+      if (timerIntervals.has(targetAssembly)) {
+        clearInterval(timerIntervals.get(targetAssembly));
+        timerIntervals.delete(targetAssembly);
+      }
+      activeQuestions.delete(targetAssembly);
+    }
+
+    // Borrado en cascada
+    await db.query(`DELETE FROM votos WHERE assembly_id = ?`, [targetAssembly]);
+    await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id IN (SELECT id FROM preguntas WHERE assembly_id = ?)`, [targetAssembly]);
+    await db.query(`DELETE FROM preguntas WHERE assembly_id = ?`, [targetAssembly]);
+    await db.query(`DELETE FROM poderes WHERE assembly_id = ?`, [targetAssembly]);
+    await db.query(`DELETE FROM documentos WHERE assembly_id = ?`, [targetAssembly]);
+    await db.query(`DELETE FROM usuarios WHERE assembly_id = ?`, [targetAssembly]);
+    await db.query(`DELETE FROM asambleas WHERE id = ?`, [targetAssembly]);
+
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('assembly:deleted', { message: 'Esta asamblea ha sido eliminada por la administración general.' });
+    io.emit('assemblies:updated');
+
+    res.json({ ok: true, message: `Asamblea #${targetAssembly} y todos sus datos relacionados fueron eliminados permanentemente.` });
+  } catch (err) {
+    console.error('Error al eliminar asamblea:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API SUPERADMIN: DEPURAR ASAMBLEA (RESET VOTOS Y PREGUNTAS)
 app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
   try {
     const { id } = req.params;
@@ -317,6 +352,46 @@ app.post('/api/support-users', async (req, res) => {
     } catch (e) {
       res.json({ ok: true, message: `Usuario de soporte ${targetId} registrado.` });
     }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API ASESOR TÉCNICO: OBTENER SESIONES CONECTADAS EN TIEMPO REAL
+app.get('/api/support/active-sessions/:assemblyId', async (req, res) => {
+  try {
+    const { assemblyId } = req.params;
+    const targetAssembly = parseInt(assemblyId);
+
+    const activeList = [];
+    for (const [sessionKey, session] of activeSessions.entries()) {
+      if (session.assemblyId === targetAssembly) {
+        activeList.push(session);
+      }
+    }
+
+    res.json({ ok: true, totalConectados: activeList.length, sesiones: activeList });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API ASESOR TÉCNICO: DESCONECTAR / LIBERAR SESIÓN TRABADA
+app.post('/api/support/kick-user', async (req, res) => {
+  try {
+    const { assemblyId, userId } = req.body;
+    const sessionKey = `${assemblyId}_${userId}`;
+
+    if (activeSessions.has(sessionKey)) {
+      const sessionData = activeSessions.get(sessionKey);
+      io.to(sessionData.socketId).emit('auth:kicked', { message: 'El Asesor Técnico ha reiniciado tu sesión para corregir un inconveniente de conexión.' });
+      activeSessions.delete(sessionKey);
+      socketUserMap.delete(sessionData.socketId);
+      await updateAndBroadcastQuorum(assemblyId);
+      return res.json({ ok: true, message: 'Sesión liberada correctamente.' });
+    }
+
+    res.json({ ok: true, message: 'El usuario no tenía sesión activa registrada.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -800,6 +875,23 @@ app.put('/api/powers/:id/status', async (req, res) => {
   }
 });
 
+app.delete('/api/powers/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
+    if (p.length === 0) return res.status(404).json({ ok: false, error: 'Poder no encontrado' });
+
+    const targetAssembly = p[0].assembly_id;
+    await db.query(`DELETE FROM poderes WHERE id = ?`, [id]);
+
+    await updateAndBroadcastQuorum(targetAssembly);
+    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
+    res.json({ ok: true, message: 'Poder eliminado correctamente.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/powers/manual', async (req, res) => {
   try {
     const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
@@ -966,7 +1058,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
 
     const asambleaData = asambleas[0];
     
-    // Priorización inteligente de fecha para evitar desfases: fecha_evento -> hora_inicio -> primerVoto -> created_at -> hoy
+    // Priorización inteligente de fecha: fecha_evento -> hora_inicio -> primerVoto -> created_at -> hoy
     asambleaData.fecha_evento_final = asambleaData.fecha_evento || asambleaData.hora_inicio || primerVotoFecha || asambleaData.created_at || new Date();
 
     res.json({
@@ -1092,7 +1184,7 @@ io.on('connection', (socket) => {
         }
       }
 
-      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: user.identificador_unico });
+      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: user.identificador_unico, nombreCompleto: user.nombre_completo, unidad: user.unidad, rol: user.rol });
       socketUserMap.set(socket.id, sessionKey);
 
       socket.sessionKey = sessionKey;
