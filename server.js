@@ -801,6 +801,48 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
   }
 });
 
+// REST API: DATOS CONSOLIDADOS PARA GENERACIÓN DE INFORMES PDF
+app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [asambleas] = await db.query(`SELECT * FROM asambleas WHERE id = ?`, [id]);
+    if (asambleas.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
+
+    const [usuarios] = await db.query(
+      `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, email, rol 
+       FROM usuarios 
+       WHERE assembly_id = ? AND rol = 'asistente' 
+       ORDER BY unidad ASC`,
+      [id]
+    );
+
+    const [preguntas] = await db.query(
+      `SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC, id ASC`,
+      [id]
+    );
+
+    for (let p of preguntas) {
+      const [opciones] = await db.query(
+        `SELECT * FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`,
+        [p.id]
+      );
+      p.opciones = opciones;
+    }
+
+    const [votos] = await db.query(
+      `SELECT v.id, v.pregunta_id, v.usuario_id, v.opcion_id, o.texto_opcion, v.coeficiente_aplicado, v.created_at
+       FROM votos v
+       JOIN opciones_pregunta o ON v.opcion_id = o.id
+       WHERE v.assembly_id = ?`,
+      [id]
+    );
+
+    res.json({ ok: true, asamblea: asambleas[0], usuarios, preguntas, votos });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // REST API: FIRMAS ZOOM
 app.post('/api/zoom/signature', (req, res) => {
   try {
