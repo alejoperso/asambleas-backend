@@ -17,8 +17,8 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] } });
 
 // CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN (DUEÑO DEL SISTEMA)
-const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL || 'admin@ajaudiovisual.com';
-const SUPERADMIN_PASSWORD = process.env.SUPERADMIN_PASSWORD || 'MasterAdmin2026!';
+const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL || 'contacto@ajaudiovisual.com';
+const SUPERADMIN_PASSWORD = process.env.SUPERADMIN_PASSWORD || 'Alfaleon2030';
 
 // INICIALIZACIÓN DE RESEND CON API KEY
 const resend = new Resend(process.env.RESEND_API_KEY || 're_dummy_key');
@@ -45,7 +45,20 @@ async function initDbSchema() {
       )
     `);
 
-    // 2. Modificaciones de columnas auxiliares para asambleas
+    // 2. Crear tabla de usuarios_admin si no existe
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS usuarios_admin (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        nombre_completo VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        password VARCHAR(255) NOT NULL,
+        rol VARCHAR(50) DEFAULT 'superadmin',
+        estado VARCHAR(20) DEFAULT 'activo',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 3. Modificaciones de columnas auxiliares para asambleas
     const alterQueries = [
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
