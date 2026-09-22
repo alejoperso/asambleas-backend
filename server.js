@@ -16,7 +16,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] } });
 
-// CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN (DUEÑO DEL SISTEMA)
+// CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN
 const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL || 'contacto@ajaudiovisual.com';
 const SUPERADMIN_PASSWORD = process.env.SUPERADMIN_PASSWORD || 'Alfaleon2030';
 
@@ -25,16 +25,14 @@ const resend = new Resend(process.env.RESEND_API_KEY || 're_dummy_key');
 
 const activeQuestions = new Map();
 const timerIntervals = new Map();
-const activeSessions = new Map(); // sessionKey -> { userId, assemblyId, socketId, identificadorUnico }
+const activeSessions = new Map();
 const socketUserMap = new Map();
 
-// RETARDO PARA CONTROL DE FRECUENCIA (RESEND LIMIT: 2 CORREOS / SEGUNDO EN FREE TIER)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA
 async function initDbSchema() {
   try {
-    // 1. Crear tabla de documentos si no existe
     await db.query(`
       CREATE TABLE IF NOT EXISTS documentos (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -45,7 +43,6 @@ async function initDbSchema() {
       )
     `);
 
-    // 2. Crear tabla de usuarios_admin si no existe
     await db.query(`
       CREATE TABLE IF NOT EXISTS usuarios_admin (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -58,7 +55,6 @@ async function initDbSchema() {
       )
     `);
 
-    // 3. Modificaciones de columnas auxiliares para asambleas y ampliación de columna rol
     const alterQueries = [
       `ALTER TABLE usuarios MODIFY COLUMN rol VARCHAR(50) NOT NULL DEFAULT 'asistente'`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
@@ -68,9 +64,7 @@ async function initDbSchema() {
     for (const q of alterQueries) {
       try {
         await db.query(q);
-      } catch (e) {
-        // Ignorar error si la columna ya existe o ya fue modificada
-      }
+      } catch (e) {}
     }
     console.log('✅ Verificación y migración de esquema completada.');
   } catch (err) {
@@ -79,7 +73,6 @@ async function initDbSchema() {
 }
 initDbSchema();
 
-// GENERADOR DE CONTRASEÑA ALFANUMÉRICA
 function generateAlphanumericPassword(length = 8) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
   let password = '';
@@ -89,7 +82,6 @@ function generateAlphanumericPassword(length = 8) {
   return password;
 }
 
-// BASE DE DATOS AUXILIAR EN MEMORIA EN CASO DE FALLBACK
 const memoryDocuments = [];
 const memoryChat = [];
 const memoryAssemblies = [
@@ -110,7 +102,6 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
   return { meetingId, passcode };
 }
 
-// VERIFICA SI UN USUARIO HA DELEGADO SU VOTO A UN APODERADO AUTORIZADO
 async function checkUserRepresentedStatus(userId, assemblyId) {
   try {
     const [rows] = await db.query(
@@ -130,7 +121,6 @@ async function checkUserRepresentedStatus(userId, assemblyId) {
   }
 }
 
-// DETALLE DE PODERES Y CÁLCULO DE COEFICIENTES
 async function getUserPowerDetails(userId, assemblyId) {
   try {
     const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
@@ -228,11 +218,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// ==========================================
-// MÓDULO DE AUTENTICACIÓN Y PROTECCIÓN DE ROLES
-// ==========================================
-
-// REST API: LOGIN PARA PANELES DE ADMINISTRACIÓN Y SUPERADMIN
+// REST API: LOGIN DE ADMINISTRACIÓN Y SUPERADMIN
 app.post('/api/auth/admin-login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -243,7 +229,6 @@ app.post('/api/auth/admin-login', async (req, res) => {
     const cleanEmail = email.trim().toLowerCase();
     const cleanPass = password.trim();
 
-    // 1. Autenticación de SuperAdministrador (Dueño Maestro)
     if (cleanEmail === SUPERADMIN_EMAIL.toLowerCase() && cleanPass === SUPERADMIN_PASSWORD) {
       const token = Buffer.from(`superadmin_${Date.now()}`).toString('base64');
       return res.json({
@@ -259,7 +244,6 @@ app.post('/api/auth/admin-login', async (req, res) => {
       });
     }
 
-    // 2. Autenticación para Administrador, Soporte, Moderador y Representante Legal en BD
     const [rows] = await db.query(
       `SELECT id, assembly_id, identificador_unico, nombre_completo, email, password, rol 
        FROM usuarios 
@@ -300,7 +284,7 @@ app.post('/api/auth/admin-login', async (req, res) => {
   }
 });
 
-// REST API SUPERADMIN: CREAR / OBTENER USUARIOS ADMINISTRATIVOS
+// REST API SUPERADMIN: GESTIÓN DE USUARIOS DE CONTROL
 app.get('/api/superadmin/admin-users', async (req, res) => {
   try {
     const [rows] = await db.query(
@@ -320,8 +304,8 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
   try {
     const { assemblyId, nombreCompleto, email, password, rol } = req.body;
 
-    if (!email || !password || !rol) {
-      return res.status(400).json({ ok: false, error: 'Correo, contraseña y rol son obligatorios.' });
+    if (!email || !rol) {
+      return res.status(400).json({ ok: false, error: 'Correo y rol son obligatorios.' });
     }
 
     const validRoles = ['administrador', 'soporte', 'moderador', 'representante_legal'];
@@ -334,23 +318,38 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
     const targetAssembly = parseInt(assemblyId) || 1;
     const identificadorUnico = `${rol.toUpperCase()}-${Date.now().toString().slice(-4)}`;
 
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password.trim(), salt);
+    let hashedPassword = null;
+    if (password && password.trim() !== '') {
+      const salt = await bcrypt.genSalt(10);
+      hashedPassword = await bcrypt.hash(password.trim(), salt);
+    }
 
-    await db.query(
-      `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
-       VALUES (?, ?, ?, 'GESTIÓN', ?, ?, 0.00000, ?)
-       ON DUPLICATE KEY UPDATE 
-         nombre_completo = VALUES(nombre_completo),
-         password = VALUES(password),
-         rol = VALUES(rol),
-         assembly_id = VALUES(assembly_id)`,
-      [targetAssembly, identificadorUnico, cleanName, cleanEmail, hashedPassword, rol]
-    );
+    if (hashedPassword) {
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
+         VALUES (?, ?, ?, 'GESTIÓN', ?, ?, 0.00000, ?)
+         ON DUPLICATE KEY UPDATE 
+           nombre_completo = VALUES(nombre_completo),
+           password = VALUES(password),
+           rol = VALUES(rol),
+           assembly_id = VALUES(assembly_id)`,
+        [targetAssembly, identificadorUnico, cleanName, cleanEmail, hashedPassword, rol]
+      );
+    } else {
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
+         VALUES (?, ?, ?, 'GESTIÓN', ?, '', 0.00000, ?)
+         ON DUPLICATE KEY UPDATE 
+           nombre_completo = VALUES(nombre_completo),
+           rol = VALUES(rol),
+           assembly_id = VALUES(assembly_id)`,
+        [targetAssembly, identificadorUnico, cleanName, cleanEmail, rol]
+      );
+    }
 
-    res.json({ ok: true, message: `Usuario con rol [${rol}] creado/actualizado correctamente.` });
+    res.json({ ok: true, message: `Usuario con rol [${rol}] guardado correctamente.` });
   } catch (err) {
-    console.error('Error al crear admin user:', err);
+    console.error('Error al crear/actualizar admin user:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -372,7 +371,6 @@ app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
       const [rows] = await db.query(`SELECT * FROM asambleas ORDER BY id DESC`);
       return res.json({ ok: true, asambleas: rows, assemblies: rows });
     } catch (e) {
-      console.error('Error al consultar asambleas en BD:', e);
       return res.json({ ok: true, asambleas: memoryAssemblies, assemblies: memoryAssemblies });
     }
   } catch (err) {
@@ -380,7 +378,6 @@ app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   }
 });
 
-// REST API: INICIAR Y CERRAR ASAMBLEA
 app.post('/api/assemblies/:id/start', async (req, res) => {
   try {
     const { id } = req.params;
@@ -427,13 +424,11 @@ app.post('/api/assemblies/:id/close', async (req, res) => {
   }
 });
 
-// REST API SUPERADMIN: ELIMINACIÓN DEFINITIVA DE ASAMBLEA EN CASCADA (TOLERANTE A TABLAS FALTANTES)
 app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const targetAssembly = parseInt(id);
 
-    // Detener cronómetros activos
     if (activeQuestions.has(targetAssembly)) {
       if (timerIntervals.has(targetAssembly)) {
         clearInterval(timerIntervals.get(targetAssembly));
@@ -442,7 +437,6 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
       activeQuestions.delete(targetAssembly);
     }
 
-    // Lista de pasos de borrado tolerantes a fallos
     const cleanupSteps = [
       { name: 'votos', query: `DELETE FROM votos WHERE assembly_id = ?`, params: [targetAssembly] },
       { name: 'opciones_pregunta', query: `DELETE FROM opciones_pregunta WHERE pregunta_id IN (SELECT id FROM preguntas WHERE assembly_id = ?)`, params: [targetAssembly] },
@@ -472,26 +466,20 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
   }
 });
 
-// REST API SUPERADMIN: DEPURAR ASAMBLEA (RESET VOTOS Y PREGUNTAS)
 app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
   try {
     const { id } = req.params;
     const targetAssembly = parseInt(id);
 
-    // 1. Eliminar todos los votos de la asamblea
     await db.query(`DELETE FROM votos WHERE assembly_id = ?`, [targetAssembly]);
-
-    // 2. Restaurar estado de preguntas a 'borrador'
     await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE assembly_id = ?`, [targetAssembly]);
 
-    // 3. Limpiar horas de inicio/cierre y restablecer estado a 'programada'
     try {
       await db.query(`UPDATE asambleas SET estado = 'programada', hora_inicio = NULL, hora_cierre = NULL WHERE id = ?`, [targetAssembly]);
     } catch (e) {
       await db.query(`UPDATE asambleas SET estado = 'programada' WHERE id = ?`, [targetAssembly]);
     }
 
-    // 4. Detener cronómetros o preguntas activas
     if (activeQuestions.has(targetAssembly)) {
       if (timerIntervals.has(targetAssembly)) {
         clearInterval(timerIntervals.get(targetAssembly));
@@ -500,7 +488,6 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
       activeQuestions.delete(targetAssembly);
     }
 
-    // 5. Emitir eventos de actualización a los clientes conectados
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('assembly:reset', { message: 'La asamblea ha sido depurada y reiniciada.' });
     io.to(roomName).emit('questions:updated');
@@ -513,7 +500,6 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
   }
 });
 
-// REST API: CREAR USUARIO DE SOPORTE PERMANENTE
 app.post('/api/support-users', async (req, res) => {
   try {
     const { assemblyId, identificadorUnico, nombreCompleto } = req.body;
@@ -535,7 +521,6 @@ app.post('/api/support-users', async (req, res) => {
   }
 });
 
-// REST API ASESOR TÉCNICO: OBTENER SESIONES CONECTADAS EN TIEMPO REAL
 app.get('/api/support/active-sessions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -554,7 +539,6 @@ app.get('/api/support/active-sessions/:assemblyId', async (req, res) => {
   }
 });
 
-// REST API ASESOR TÉCNICO: DESCONECTAR / LIBERAR SESIÓN TRABADA
 app.post('/api/support/kick-user', async (req, res) => {
   try {
     const { assemblyId, userId } = req.body;
@@ -575,7 +559,6 @@ app.post('/api/support/kick-user', async (req, res) => {
   }
 });
 
-// REST API: SUPER ADMINISTRADOR
 app.get('/api/superadmin/assemblies', async (req, res) => {
   try {
     try {
@@ -642,7 +625,6 @@ app.post('/api/superadmin/assign-role', async (req, res) => {
   }
 });
 
-// REST API: CARGA MASIVA DE PADRÓN ELECTORAL
 app.post('/api/superadmin/users/bulk', async (req, res) => {
   try {
     const { assemblyId, users } = req.body;
@@ -684,7 +666,6 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
-// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -774,7 +755,6 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
   }
 });
 
-// REST API: GENERAR Y ENVIAR CREDENCIAL A UN USUARIO
 app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
@@ -858,7 +838,6 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
   }
 });
 
-// REST API: BRANDING Y DETALLES DE ASAMBLEA
 app.get('/api/assemblies/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -887,7 +866,6 @@ app.put('/api/assemblies/:id/info', async (req, res) => {
   }
 });
 
-// REST API: REPOSITORIO DE DOCUMENTOS
 app.get('/api/documents/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -935,7 +913,6 @@ app.delete('/api/documents/:id', async (req, res) => {
   }
 });
 
-// REST API: PREGUNTAS Y OPCIONES
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1014,7 +991,6 @@ app.delete('/api/questions/:id', async (req, res) => {
   }
 });
 
-// REST API: PODERES Y USUARIOS
 app.get('/api/powers/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1180,7 +1156,6 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
   }
 });
 
-// REST API: DATOS CONSOLIDADOS PARA INFORMES PDF CON FALLBACKS DE FECHA
 app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1216,7 +1191,6 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
       [id]
     );
 
-    // Conectados en tiempo real
     const activeUserIds = new Set();
     for (const [key, session] of activeSessions.entries()) {
       if (session.assemblyId === parseInt(id)) {
@@ -1228,15 +1202,12 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
     const totalConectados = activeUserIds.size;
     const totalNoConectados = Math.max(0, totalCargados - totalConectados);
 
-    // Determinar primera fecha de voto registrada como fallback
     let primerVotoFecha = null;
     if (votos.length > 0) {
       primerVotoFecha = votos[0].created_at;
     }
 
     const asambleaData = asambleas[0];
-    
-    // Priorización inteligente de fecha: fecha_evento -> hora_inicio -> primerVoto -> created_at -> hoy
     asambleaData.fecha_evento_final = asambleaData.fecha_evento || asambleaData.hora_inicio || primerVotoFecha || asambleaData.created_at || new Date();
 
     res.json({
@@ -1256,7 +1227,6 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// REST API: FIRMAS ZOOM
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
@@ -1312,7 +1282,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
 
 app.get('/', (req, res) => res.json({ status: 'online', version: '3.0.0-master' }));
 
-// WEBSOCKETS EN TIEMPO REAL CON VALIDACIÓN DE CONTRASEÑA Y USUARIO
+// WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
 
   socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password }) => {
