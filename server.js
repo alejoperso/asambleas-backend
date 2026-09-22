@@ -284,7 +284,7 @@ app.post('/api/auth/admin-login', async (req, res) => {
   }
 });
 
-// REST API SUPERADMIN: GESTIÓN DE USUARIOS DE CONTROL
+// REST API SUPERADMIN: GESTIÓN GLOBAL DE USUARIOS DE CONTROL
 app.get('/api/superadmin/admin-users', async (req, res) => {
   try {
     const [rows] = await db.query(
@@ -351,6 +351,84 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
   } catch (err) {
     console.error('Error al crear/actualizar admin user:', err);
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ENVIAR CORREO CON CREDENCIALES AL PERSONAL DE CONTROL (ADMIN, MODERADOR, SOPORTE)
+app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
+  try {
+    const { userId, customPassword } = req.body;
+    if (!userId) return res.status(400).json({ ok: false, error: 'ID de usuario requerido.' });
+
+    const [usuarios] = await db.query(
+      `SELECT u.id, u.identificador_unico, u.nombre_completo, u.email, u.rol, u.assembly_id, a.nombre_copropiedad 
+       FROM usuarios u 
+       LEFT JOIN asambleas a ON u.assembly_id = a.id 
+       WHERE u.id = ?`,
+      [userId]
+    );
+
+    if (usuarios.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Usuario de control no encontrado.' });
+    }
+
+    const user = usuarios[0];
+    if (!user.email || user.email.trim() === '') {
+      return res.status(400).json({ ok: false, error: 'El usuario no tiene un correo electrónico registrado.' });
+    }
+
+    const plainPassword = (customPassword && customPassword.trim() !== '') 
+      ? customPassword.trim() 
+      : generateAlphanumericPassword(8);
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(plainPassword, salt);
+
+    await db.query(`UPDATE usuarios SET password = ? WHERE id = ?`, [hashedPassword, user.id]);
+
+    const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
+    const adminUrl = `${clientUrl}/admin.html?asamblea=${user.assembly_id || 1}`;
+    const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
+    const copropiedadNombre = user.nombre_copropiedad || 'Asamblea Virtual';
+    const rolNombre = user.rol === 'administrador' ? 'Administrador' : user.rol === 'moderador' ? 'Moderador' : 'Soporte Técnico';
+
+    const emailResult = await resend.emails.send({
+      from: `Plataforma Asambleas <${fromSender}>`,
+      to: [user.email],
+      subject: `Acceso Panel de Control (${rolNombre}) - ${copropiedadNombre}`,
+      text: `Estimado(a) ${user.nombre_completo}, se te han asignado permisos de ${rolNombre} para ${copropiedadNombre}. URL: ${adminUrl} | Usuario: ${user.email} | Contraseña: ${plainPassword}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
+          <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a Consola de Control</h2>
+          <p style="font-size: 14px; line-height: 1.6;">Estimado(a) <strong>${user.nombre_completo}</strong>,</p>
+          <p style="font-size: 14px; line-height: 1.6;">Se le han otorgado credenciales de acceso como <strong>${rolNombre}</strong> para la gestión de <strong>${copropiedadNombre}</strong>.</p>
+          
+          <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Enlace de Control:</strong> <a href="${adminUrl}" style="color: #38bdf8; word-break: break-all;">${adminUrl}</a></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
+          </div>
+
+          <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
+            Mensaje automático del Sistema de Asambleas Virtuales.
+          </p>
+        </div>
+      `
+    });
+
+    if (emailResult.error) {
+      return res.status(500).json({ ok: false, error: emailResult.error.message });
+    }
+
+    return res.json({
+      ok: true,
+      message: `Credenciales de control enviadas a ${user.email}.`,
+      plainPassword: plainPassword
+    });
+
+  } catch (err) {
+    console.error('Error enviando credencial de control:', err);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
