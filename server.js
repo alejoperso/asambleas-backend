@@ -27,7 +27,7 @@ const socketUserMap = new Map();
 // RETARDO PARA CONTROL DE FRECUENCIA (RESEND LIMIT: 2 CORREOS / SEGUNDO EN FREE TIER)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA (EVITA ERRORES SQL SI LAS COLUMNAS NO EXISTEN)
+// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA
 async function initDbSchema() {
   try {
     const alterQueries = [
@@ -39,7 +39,7 @@ async function initDbSchema() {
       try {
         await db.query(q);
       } catch (e) {
-        // Ignorar error si la columna ya existe en MySQL
+        // Ignorar error si la columna ya existe
       }
     }
   } catch (err) {
@@ -197,7 +197,7 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: ASAMBLEAS ACTIVAS (USO DE SELECT * PARA GARANTIZAR COMPATIBILIDAD 100%)
+// REST API: ASAMBLEAS ACTIVAS
 app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   try {
     try {
@@ -255,6 +255,47 @@ app.post('/api/assemblies/:id/close', async (req, res) => {
 
     res.json({ ok: true, message: 'Asamblea finalizada y cerrada oficialmente.', horaCierre: now });
   } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: DEPURAR ASAMBLEA (BORRAR VOTOS Y REINICIAR ESTADO PARA PRUEBAS)
+app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const targetAssembly = parseInt(id);
+
+    // 1. Eliminar todos los votos de la asamblea
+    await db.query(`DELETE FROM votos WHERE assembly_id = ?`, [targetAssembly]);
+
+    // 2. Restaurar estado de preguntas a 'borrador'
+    await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE assembly_id = ?`, [targetAssembly]);
+
+    // 3. Limpiar horas de inicio/cierre y restablecer estado a 'programada'
+    try {
+      await db.query(`UPDATE asambleas SET estado = 'programada', hora_inicio = NULL, hora_cierre = NULL WHERE id = ?`, [targetAssembly]);
+    } catch (e) {
+      await db.query(`UPDATE asambleas SET estado = 'programada' WHERE id = ?`, [targetAssembly]);
+    }
+
+    // 4. Detener cronómetros o preguntas activas
+    if (activeQuestions.has(targetAssembly)) {
+      if (timerIntervals.has(targetAssembly)) {
+        clearInterval(timerIntervals.get(targetAssembly));
+        timerIntervals.delete(targetAssembly);
+      }
+      activeQuestions.delete(targetAssembly);
+    }
+
+    // 5. Emitir eventos de actualización a los clientes conectados
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('assembly:reset', { message: 'La asamblea ha sido depurada y reiniciada.' });
+    io.to(roomName).emit('questions:updated');
+    io.emit('assemblies:updated');
+
+    res.json({ ok: true, message: 'Asamblea depurada exitosamente. Se borraron los votos y las preguntas volvieron a estado inicial.' });
+  } catch (err) {
+    console.error('Error al depurar asamblea:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
