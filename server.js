@@ -226,7 +226,7 @@ app.post('/api/assemblies/:id/start', async (req, res) => {
     const roomName = `assembly_${id}`;
     io.to(roomName).emit('assembly:started', {
       message: '¡La Asamblea ha iniciado oficialmente!',
-      horaInicio: now.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      horaInicio: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
     });
     io.emit('assemblies:updated');
 
@@ -249,7 +249,7 @@ app.post('/api/assemblies/:id/close', async (req, res) => {
     const roomName = `assembly_${id}`;
     io.to(roomName).emit('assembly:closed', {
       message: 'La Asamblea ha sido cerrada de manera oficial.',
-      horaCierre: now.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      horaCierre: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
     });
     io.emit('assemblies:updated');
 
@@ -898,7 +898,7 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
     let csvContent = "\uFEFFPregunta;ID Votante;Nombre;Unidad;Opción Votada;Coeficiente Aplicado (%);Fecha y Hora\n";
     votos.forEach(v => {
       const coefPct = parseFloat(v.Coeficiente_Efectivo).toFixed(4);
-      const fecha = new Date(v.Fecha_Hora_Voto).toLocaleString('es-CO');
+      const fecha = new Date(v.Fecha_Hora_Voto).toLocaleString('es-CO', { timeZone: 'America/Bogota' });
       csvContent += `"${v.Pregunta}";"${v.ID_Votante}";"${v.Nombre}";"${v.Unidad}";"${v.Opcion_Votada}";"${coefPct}%";"${fecha}"\n`;
     });
 
@@ -958,14 +958,16 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
     const totalConectados = activeUserIds.size;
     const totalNoConectados = Math.max(0, totalCargados - totalConectados);
 
-    // Determinar primera fecha de voto registrada como fallback si fecha_evento no existe
+    // Determinar primera fecha de voto registrada como fallback
     let primerVotoFecha = null;
     if (votos.length > 0) {
       primerVotoFecha = votos[0].created_at;
     }
 
     const asambleaData = asambleas[0];
-    asambleaData.fecha_evento_final = asambleaData.fecha_evento || asambleaData.created_at || primerVotoFecha || new Date();
+    
+    // Priorización inteligente de fecha para evitar desfases: fecha_evento -> hora_inicio -> primerVoto -> created_at -> hoy
+    asambleaData.fecha_evento_final = asambleaData.fecha_evento || asambleaData.hora_inicio || primerVotoFecha || asambleaData.created_at || new Date();
 
     res.json({
       ok: true,
@@ -1129,7 +1131,7 @@ io.on('connection', (socket) => {
       texto,
       emisor: emisor || 'Asistente',
       unidad: unidad || '---',
-      hora: new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
+      hora: new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit' })
     };
     memoryChat.push(msgData);
     if (memoryChat.length > 100) memoryChat.shift();
