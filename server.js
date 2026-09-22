@@ -16,6 +16,10 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] } });
 
+// CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN (DUEÑO DEL SISTEMA)
+const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL || 'admin@ajaudiovisual.com';
+const SUPERADMIN_PASSWORD = process.env.SUPERADMIN_PASSWORD || 'MasterAdmin2026!';
+
 // INICIALIZACIÓN DE RESEND CON API KEY
 const resend = new Resend(process.env.RESEND_API_KEY || 're_dummy_key');
 
@@ -209,6 +213,143 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   });
   return results;
 }
+
+// ==========================================
+// MÓDULO DE AUTENTICACIÓN Y PROTECCIÓN DE ROLES
+// ==========================================
+
+// REST API: LOGIN PARA PANELES DE ADMINISTRACIÓN Y SUPERADMIN
+app.post('/api/auth/admin-login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: 'Correo y contraseña requeridos.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanPass = password.trim();
+
+    // 1. Autenticación de SuperAdministrador (Dueño Maestro)
+    if (cleanEmail === SUPERADMIN_EMAIL.toLowerCase() && cleanPass === SUPERADMIN_PASSWORD) {
+      const token = Buffer.from(`superadmin_${Date.now()}`).toString('base64');
+      return res.json({
+        ok: true,
+        user: {
+          id: 0,
+          nombre_completo: 'Super Administrador',
+          email: SUPERADMIN_EMAIL,
+          rol: 'superadmin',
+          assembly_id: null
+        },
+        token
+      });
+    }
+
+    // 2. Autenticación para Administrador, Soporte y Representante Legal en BD
+    const [rows] = await db.query(
+      `SELECT id, assembly_id, identificador_unico, nombre_completo, email, password, rol 
+       FROM usuarios 
+       WHERE LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'representante_legal')`,
+      [cleanEmail]
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ ok: false, error: 'Credenciales inválidas o sin permisos de gestión.' });
+    }
+
+    const adminUser = rows[0];
+    if (!adminUser.password || adminUser.password.trim() === '') {
+      return res.status(401).json({ ok: false, error: 'El usuario no tiene una contraseña configurada.' });
+    }
+
+    const isMatch = await bcrypt.compare(cleanPass, adminUser.password);
+    if (!isMatch) {
+      return res.status(401).json({ ok: false, error: 'Contraseña incorrecta.' });
+    }
+
+    const token = Buffer.from(`${adminUser.rol}_${adminUser.id}_${Date.now()}`).toString('base64');
+    return res.json({
+      ok: true,
+      user: {
+        id: adminUser.id,
+        nombre_completo: adminUser.nombre_completo,
+        email: adminUser.email,
+        rol: adminUser.rol,
+        assembly_id: adminUser.assembly_id,
+        identificador_unico: adminUser.identificador_unico
+      },
+      token
+    });
+  } catch (err) {
+    console.error('Error en admin-login:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API SUPERADMIN: CREAR / OBTENER USUARIOS ADMINISTRATIVOS
+app.get('/api/superadmin/admin-users', async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT u.id, u.assembly_id, u.identificador_unico, u.nombre_completo, u.email, u.rol, u.created_at, a.nombre_copropiedad
+       FROM usuarios u
+       LEFT JOIN asambleas a ON u.assembly_id = a.id
+       WHERE u.rol IN ('administrador', 'soporte', 'representante_legal')
+       ORDER BY u.id DESC`
+    );
+    res.json({ ok: true, adminUsers: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/superadmin/admin-users', async (req, res) => {
+  try {
+    const { assemblyId, nombreCompleto, email, password, rol } = req.body;
+
+    if (!email || !password || !rol) {
+      return res.status(400).json({ ok: false, error: 'Correo, contraseña y rol son obligatorios.' });
+    }
+
+    const validRoles = ['administrador', 'soporte', 'representante_legal'];
+    if (!validRoles.includes(rol)) {
+      return res.status(400).json({ ok: false, error: 'Rol no válido.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanName = (nombreCompleto || 'Usuario Gestión').trim();
+    const targetAssembly = parseInt(assemblyId) || 1;
+    const identificadorUnico = `${rol.toUpperCase()}-${Date.now().toString().slice(-4)}`;
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password.trim(), salt);
+
+    await db.query(
+      `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
+       VALUES (?, ?, ?, 'GESTIÓN', ?, ?, 0.00000, ?)
+       ON DUPLICATE KEY UPDATE 
+         nombre_completo = VALUES(nombre_completo),
+         password = VALUES(password),
+         rol = VALUES(rol),
+         assembly_id = VALUES(assembly_id)`,
+      [targetAssembly, identificadorUnico, cleanName, cleanEmail, hashedPassword, rol]
+    );
+
+    res.json({ ok: true, message: `Usuario con rol [${rol}] creado/actualizado correctamente.` });
+  } catch (err) {
+    console.error('Error al crear admin user:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/superadmin/admin-users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query(`DELETE FROM usuarios WHERE id = ? AND rol IN ('administrador', 'soporte', 'representante_legal')`, [id]);
+    res.json({ ok: true, message: 'Usuario de gestión eliminado.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // REST API: ASAMBLEAS ACTIVAS
 app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
