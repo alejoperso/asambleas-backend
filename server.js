@@ -27,6 +27,27 @@ const socketUserMap = new Map();
 // RETARDO PARA CONTROL DE FRECUENCIA (RESEND LIMIT: 2 CORREOS / SEGUNDO EN FREE TIER)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA (EVITA ERRORES SQL SI LAS COLUMNAS NO EXISTEN)
+async function initDbSchema() {
+  try {
+    const alterQueries = [
+      `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
+      `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
+      `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
+    ];
+    for (const q of alterQueries) {
+      try {
+        await db.query(q);
+      } catch (e) {
+        // Ignorar error si la columna ya existe en MySQL
+      }
+    }
+  } catch (err) {
+    console.warn('Verificación de esquema completada.');
+  }
+}
+initDbSchema();
+
 // GENERADOR DE CONTRASEÑA ALFANUMÉRICA
 function generateAlphanumericPassword(length = 8) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
@@ -176,13 +197,14 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: ASAMBLEAS ACTIVAS PARA LANDING PAGE
+// REST API: ASAMBLEAS ACTIVAS (USO DE SELECT * PARA GARANTIZAR COMPATIBILIDAD 100%)
 app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   try {
     try {
-      const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, estado, fecha_evento, hora_inicio, hora_cierre FROM asambleas ORDER BY id DESC`);
+      const [rows] = await db.query(`SELECT * FROM asambleas ORDER BY id DESC`);
       return res.json({ ok: true, asambleas: rows, assemblies: rows });
     } catch (e) {
+      console.error('Error al consultar asambleas en BD:', e);
       return res.json({ ok: true, asambleas: memoryAssemblies, assemblies: memoryAssemblies });
     }
   } catch (err) {
@@ -190,18 +212,15 @@ app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   }
 });
 
-// REST API: INICIAR Y CERRAR ASAMBLEA CON NOTIFICACIÓN VÍA SOCKET.IO
+// REST API: INICIAR Y CERRAR ASAMBLEA
 app.post('/api/assemblies/:id/start', async (req, res) => {
   try {
     const { id } = req.params;
     const now = new Date();
     try {
-      await db.query(
-        `UPDATE asambleas SET estado = 'en_curso', hora_inicio = IFNULL(hora_inicio, NOW()), fecha_evento = IFNULL(fecha_evento, CURRENT_DATE()) WHERE id = ?`,
-        [id]
-      );
+      await db.query(`UPDATE asambleas SET estado = 'en_curso', hora_inicio = NOW() WHERE id = ?`, [id]);
     } catch (e) {
-      console.warn('Advertencia actualizando estado de asamblea en DB:', e.message);
+      await db.query(`UPDATE asambleas SET estado = 'en_curso' WHERE id = ?`, [id]);
     }
 
     const roomName = `assembly_${id}`;
@@ -224,7 +243,7 @@ app.post('/api/assemblies/:id/close', async (req, res) => {
     try {
       await db.query(`UPDATE asambleas SET estado = 'finalizada', hora_cierre = NOW() WHERE id = ?`, [id]);
     } catch (e) {
-      console.warn('Advertencia cerrando asamblea en DB:', e.message);
+      await db.query(`UPDATE asambleas SET estado = 'finalizada' WHERE id = ?`, [id]);
     }
 
     const roomName = `assembly_${id}`;
@@ -283,8 +302,8 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
 
     const [result] = await db.query(
-      `INSERT INTO asambleas (nombre_copropiedad, logo_url, fecha_evento, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
-       VALUES (?, ?, CURRENT_DATE(), 'programada', ?, ?, ?, ?)`,
+      `INSERT INTO asambleas (nombre_copropiedad, logo_url, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
+       VALUES (?, ?, 'programada', ?, ?, ?, ?)`,
       [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode, parsed.passcode]
     );
     const assemblyId = result.insertId;
@@ -308,7 +327,7 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     io.emit('assemblies:updated');
     return res.json({ ok: true, assemblyId, message: 'Asamblea creada con éxito.' });
   } catch (err) {
-    console.error('Error crítico al crear asamblea en MySQL:', err);
+    console.error('Error al crear asamblea:', err);
     return res.status(500).json({ ok: false, error: `Error SQL: ${err.message}` });
   }
 });
@@ -371,7 +390,7 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
-// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK CON PACING MASIVO
+// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -441,7 +460,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
           sentCount++;
         }
       } catch (sendErr) {
-        console.error(`Error de excepción enviando correo a ${user.email}:`, sendErr);
+        console.error(`Error enviando correo a ${user.email}:`, sendErr);
         errorCount++;
       }
 
@@ -450,7 +469,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
 
     return res.json({
       ok: true,
-      message: `Proceso completado con Resend. Enviados: ${sentCount}, Fallidos: ${errorCount}.`,
+      message: `Proceso completado. Enviados: ${sentCount}, Fallidos: ${errorCount}.`,
       sentCount,
       errorCount
     });
@@ -461,7 +480,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
   }
 });
 
-// REST API: GENERAR, ACTUALIZAR Y ENVIAR CREDENCIAL A UN SOLO USUARIO INDIVIDUAL
+// REST API: GENERAR Y ENVIAR CREDENCIAL A UN USUARIO
 app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
@@ -549,7 +568,7 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
 app.get('/api/assemblies/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, estado, fecha_evento, hora_inicio, hora_cierre, zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
+    const [rows] = await db.query(`SELECT * FROM asambleas WHERE id = ?`, [id]);
     if (rows.length === 0) {
       return res.json({
         ok: true,
@@ -850,7 +869,7 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
   }
 });
 
-// REST API: DATOS CONSOLIDADOS PARA INFORMES PDF Y CÁLCULO DE ASISTENCIA
+// REST API: DATOS CONSOLIDADOS PARA INFORMES PDF CON FALLBACKS DE FECHA
 app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   try {
     const { id } = req.params;
@@ -886,7 +905,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
       [id]
     );
 
-    // Conectados activos en memoria socket
+    // Conectados en tiempo real
     const activeUserIds = new Set();
     for (const [key, session] of activeSessions.entries()) {
       if (session.assemblyId === parseInt(id)) {
@@ -898,9 +917,18 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
     const totalConectados = activeUserIds.size;
     const totalNoConectados = Math.max(0, totalCargados - totalConectados);
 
+    // Determinar primera fecha de voto registrada como fallback si fecha_evento no existe
+    let primerVotoFecha = null;
+    if (votos.length > 0) {
+      primerVotoFecha = votos[0].created_at;
+    }
+
+    const asambleaData = asambleas[0];
+    asambleaData.fecha_evento_final = asambleaData.fecha_evento || asambleaData.created_at || primerVotoFecha || new Date();
+
     res.json({
       ok: true,
-      asamblea: asambleas[0],
+      asamblea: asambleaData,
       usuarios,
       preguntas,
       votos,
@@ -960,7 +988,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
     const { id } = req.params;
     const { zoomEmbedUrl, zoomPasscode } = req.body;
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
-    await db.query(`UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`, [id]);
+    await db.query(`UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`, [zoomEmbedUrl, parsed.meetingId, parsed.passcode, id]);
     const streamData = { meetingId: parsed.meetingId, passcode: parsed.passcode, rawUrl: zoomEmbedUrl };
     io.to(`assembly_${id}`).emit('zoom:updated', { streamInfo: streamData });
     res.json({ ok: true, message: 'Zoom actualizado.', streamInfo: streamData });
