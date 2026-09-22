@@ -41,7 +41,7 @@ function generateAlphanumericPassword(length = 8) {
 const memoryDocuments = [];
 const memoryChat = [];
 const memoryAssemblies = [
-  { id: 1, nombre_copropiedad: 'Conjunto Residencial Parque Real', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', admin_user: 'ADMIN01' }
+  { id: 1, nombre_copropiedad: 'Conjunto Residencial Parque Real', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', admin_user: 'ADMIN01', estado: 'programada' }
 ];
 
 function toBase64Url(input) {
@@ -180,11 +180,61 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
 app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   try {
     try {
-      const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, estado FROM asambleas ORDER BY id DESC`);
+      const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, estado, fecha_evento, hora_inicio, hora_cierre FROM asambleas ORDER BY id DESC`);
       return res.json({ ok: true, asambleas: rows, assemblies: rows });
     } catch (e) {
       return res.json({ ok: true, asambleas: memoryAssemblies, assemblies: memoryAssemblies });
     }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// REST API: INICIAR Y CERRAR ASAMBLEA CON NOTIFICACIÓN VÍA SOCKET.IO
+app.post('/api/assemblies/:id/start', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const now = new Date();
+    try {
+      await db.query(
+        `UPDATE asambleas SET estado = 'en_curso', hora_inicio = IFNULL(hora_inicio, NOW()), fecha_evento = IFNULL(fecha_evento, CURRENT_DATE()) WHERE id = ?`,
+        [id]
+      );
+    } catch (e) {
+      console.warn('Advertencia actualizando estado de asamblea en DB:', e.message);
+    }
+
+    const roomName = `assembly_${id}`;
+    io.to(roomName).emit('assembly:started', {
+      message: '¡La Asamblea ha iniciado oficialmente!',
+      horaInicio: now.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    });
+    io.emit('assemblies:updated');
+
+    res.json({ ok: true, message: 'Asamblea iniciada oficialmente.', horaInicio: now });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/assemblies/:id/close', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const now = new Date();
+    try {
+      await db.query(`UPDATE asambleas SET estado = 'finalizada', hora_cierre = NOW() WHERE id = ?`, [id]);
+    } catch (e) {
+      console.warn('Advertencia cerrando asamblea en DB:', e.message);
+    }
+
+    const roomName = `assembly_${id}`;
+    io.to(roomName).emit('assembly:closed', {
+      message: 'La Asamblea ha sido cerrada de manera oficial.',
+      horaCierre: now.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    });
+    io.emit('assemblies:updated');
+
+    res.json({ ok: true, message: 'Asamblea finalizada y cerrada oficialmente.', horaCierre: now });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -234,7 +284,7 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
 
     const [result] = await db.query(
       `INSERT INTO asambleas (nombre_copropiedad, logo_url, fecha_evento, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
-       VALUES (?, ?, NOW(), 'programada', ?, ?, ?, ?)`,
+       VALUES (?, ?, CURRENT_DATE(), 'programada', ?, ?, ?, ?)`,
       [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode, parsed.passcode]
     );
     const assemblyId = result.insertId;
@@ -395,7 +445,6 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
         errorCount++;
       }
 
-      // RETARDO DE 600 MS PARA CUMPLIR CON EL LÍMITE DE 2 CORREOS/SEG DE RESEND
       await sleep(600);
     }
 
@@ -500,16 +549,16 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
 app.get('/api/assemblies/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
+    const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, estado, fecha_evento, hora_inicio, hora_cierre, zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
     if (rows.length === 0) {
       return res.json({
         ok: true,
-        assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad' }
+        assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', estado: 'programada' }
       });
     }
     res.json({ ok: true, assembly: rows[0] });
   } catch (err) {
-    res.json({ ok: true, assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad' } });
+    res.json({ ok: true, assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', estado: 'programada' } });
   }
 });
 
@@ -801,7 +850,7 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
   }
 });
 
-// REST API: DATOS CONSOLIDADOS PARA GENERACIÓN DE INFORMES PDF
+// REST API: DATOS CONSOLIDADOS PARA INFORMES PDF Y CÁLCULO DE ASISTENCIA
 app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   try {
     const { id } = req.params;
@@ -837,7 +886,30 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
       [id]
     );
 
-    res.json({ ok: true, asamblea: asambleas[0], usuarios, preguntas, votos });
+    // Conectados activos en memoria socket
+    const activeUserIds = new Set();
+    for (const [key, session] of activeSessions.entries()) {
+      if (session.assemblyId === parseInt(id)) {
+        activeUserIds.add(session.userId);
+      }
+    }
+
+    const totalCargados = usuarios.length;
+    const totalConectados = activeUserIds.size;
+    const totalNoConectados = Math.max(0, totalCargados - totalConectados);
+
+    res.json({
+      ok: true,
+      asamblea: asambleas[0],
+      usuarios,
+      preguntas,
+      votos,
+      asistencia: {
+        totalCargados,
+        totalConectados,
+        totalNoConectados
+      }
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -888,7 +960,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
     const { id } = req.params;
     const { zoomEmbedUrl, zoomPasscode } = req.body;
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
-    await db.query(`UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`, [zoomEmbedUrl, parsed.meetingId, parsed.passcode, id]);
+    await db.query(`UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`, [id]);
     const streamData = { meetingId: parsed.meetingId, passcode: parsed.passcode, rawUrl: zoomEmbedUrl };
     io.to(`assembly_${id}`).emit('zoom:updated', { streamInfo: streamData });
     res.json({ ok: true, message: 'Zoom actualizado.', streamInfo: streamData });
