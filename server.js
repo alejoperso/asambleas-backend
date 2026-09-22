@@ -58,8 +58,9 @@ async function initDbSchema() {
       )
     `);
 
-    // 3. Modificaciones de columnas auxiliares para asambleas
+    // 3. Modificaciones de columnas auxiliares para asambleas y ampliación de columna rol
     const alterQueries = [
+      `ALTER TABLE usuarios MODIFY COLUMN rol VARCHAR(50) NOT NULL DEFAULT 'asistente'`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
@@ -68,7 +69,7 @@ async function initDbSchema() {
       try {
         await db.query(q);
       } catch (e) {
-        // Ignorar error si la columna ya existe
+        // Ignorar error si la columna ya existe o ya fue modificada
       }
     }
     console.log('✅ Verificación y migración de esquema completada.');
@@ -258,11 +259,11 @@ app.post('/api/auth/admin-login', async (req, res) => {
       });
     }
 
-    // 2. Autenticación para Administrador, Soporte y Representante Legal en BD
+    // 2. Autenticación para Administrador, Soporte, Moderador y Representante Legal en BD
     const [rows] = await db.query(
       `SELECT id, assembly_id, identificador_unico, nombre_completo, email, password, rol 
        FROM usuarios 
-       WHERE LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'representante_legal')`,
+       WHERE LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')`,
       [cleanEmail]
     );
 
@@ -306,7 +307,7 @@ app.get('/api/superadmin/admin-users', async (req, res) => {
       `SELECT u.id, u.assembly_id, u.identificador_unico, u.nombre_completo, u.email, u.rol, u.created_at, a.nombre_copropiedad
        FROM usuarios u
        LEFT JOIN asambleas a ON u.assembly_id = a.id
-       WHERE u.rol IN ('administrador', 'soporte', 'representante_legal')
+       WHERE u.rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')
        ORDER BY u.id DESC`
     );
     res.json({ ok: true, adminUsers: rows });
@@ -323,7 +324,7 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Correo, contraseña y rol son obligatorios.' });
     }
 
-    const validRoles = ['administrador', 'soporte', 'representante_legal'];
+    const validRoles = ['administrador', 'soporte', 'moderador', 'representante_legal'];
     if (!validRoles.includes(rol)) {
       return res.status(400).json({ ok: false, error: 'Rol no válido.' });
     }
@@ -357,7 +358,7 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
 app.delete('/api/superadmin/admin-users/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await db.query(`DELETE FROM usuarios WHERE id = ? AND rol IN ('administrador', 'soporte', 'representante_legal')`, [id]);
+    await db.query(`DELETE FROM usuarios WHERE id = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')`, [id]);
     res.json({ ok: true, message: 'Usuario de gestión eliminado.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
