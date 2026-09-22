@@ -30,6 +30,18 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA
 async function initDbSchema() {
   try {
+    // 1. Crear tabla de documentos si no existe
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS documentos (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        assembly_id INT NOT NULL,
+        titulo VARCHAR(255) NOT NULL,
+        archivo_url LONGTEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 2. Modificaciones de columnas auxiliares para asambleas
     const alterQueries = [
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
@@ -42,8 +54,9 @@ async function initDbSchema() {
         // Ignorar error si la columna ya existe
       }
     }
+    console.log('✅ Verificación y migración de esquema completada.');
   } catch (err) {
-    console.warn('Verificación de esquema completada.');
+    console.warn('Advertencia en verificación de esquema:', err.message);
   }
 }
 initDbSchema();
@@ -259,7 +272,7 @@ app.post('/api/assemblies/:id/close', async (req, res) => {
   }
 });
 
-// REST API SUPERADMIN: ELIMINACIÓN DEFINITIVA DE ASAMBLEA EN CASCADA
+// REST API SUPERADMIN: ELIMINACIÓN DEFINITIVA DE ASAMBLEA EN CASCADA (TOLERANTE A TABLAS FALTANTES)
 app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -274,14 +287,24 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
       activeQuestions.delete(targetAssembly);
     }
 
-    // Borrado en cascada
-    await db.query(`DELETE FROM votos WHERE assembly_id = ?`, [targetAssembly]);
-    await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id IN (SELECT id FROM preguntas WHERE assembly_id = ?)`, [targetAssembly]);
-    await db.query(`DELETE FROM preguntas WHERE assembly_id = ?`, [targetAssembly]);
-    await db.query(`DELETE FROM poderes WHERE assembly_id = ?`, [targetAssembly]);
-    await db.query(`DELETE FROM documentos WHERE assembly_id = ?`, [targetAssembly]);
-    await db.query(`DELETE FROM usuarios WHERE assembly_id = ?`, [targetAssembly]);
-    await db.query(`DELETE FROM asambleas WHERE id = ?`, [targetAssembly]);
+    // Lista de pasos de borrado tolerantes a fallos
+    const cleanupSteps = [
+      { name: 'votos', query: `DELETE FROM votos WHERE assembly_id = ?`, params: [targetAssembly] },
+      { name: 'opciones_pregunta', query: `DELETE FROM opciones_pregunta WHERE pregunta_id IN (SELECT id FROM preguntas WHERE assembly_id = ?)`, params: [targetAssembly] },
+      { name: 'preguntas', query: `DELETE FROM preguntas WHERE assembly_id = ?`, params: [targetAssembly] },
+      { name: 'poderes', query: `DELETE FROM poderes WHERE assembly_id = ?`, params: [targetAssembly] },
+      { name: 'documentos', query: `DELETE FROM documentos WHERE assembly_id = ?`, params: [targetAssembly] },
+      { name: 'usuarios', query: `DELETE FROM usuarios WHERE assembly_id = ?`, params: [targetAssembly] },
+      { name: 'asambleas', query: `DELETE FROM asambleas WHERE id = ?`, params: [targetAssembly] }
+    ];
+
+    for (const step of cleanupSteps) {
+      try {
+        await db.query(step.query, step.params);
+      } catch (errStep) {
+        console.warn(`Aviso durante limpieza de [${step.name}]:`, errStep.message);
+      }
+    }
 
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('assembly:deleted', { message: 'Esta asamblea ha sido eliminada por la administración general.' });
