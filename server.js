@@ -279,6 +279,29 @@ async function updateAndBroadcastQuorum(assemblyId) {
   }
 }
 
+async function getVotingStats(assemblyId, preguntaId) {
+  try {
+    const activeUserIds = new Set();
+    for (const [key, session] of activeSessions.entries()) {
+      if (session.assemblyId === parseInt(assemblyId)) {
+        activeUserIds.add(session.userId);
+      }
+    }
+    const totalConectados = activeUserIds.size;
+
+    const [rows] = await db.query(
+      `SELECT COUNT(DISTINCT usuario_id) AS totalVotaron FROM votos WHERE assembly_id = ? AND pregunta_id = ?`,
+      [assemblyId, preguntaId]
+    );
+    const hanVotado = rows[0] ? parseInt(rows[0].totalVotaron) || 0 : 0;
+    const faltanPorVotar = Math.max(0, totalConectados - hanVotado);
+
+    return { totalConectados, hanVotado, faltanPorVotar };
+  } catch (err) {
+    return { totalConectados: 0, hanVotado: 0, faltanPorVotar: 0 };
+  }
+}
+
 async function calculateWeightedResults(assemblyId, preguntaId) {
   const [votos] = await db.query(
     `SELECT v.opcion_id, v.coeficiente_aplicado FROM votos v WHERE v.assembly_id = ? AND v.pregunta_id = ?`,
@@ -1082,11 +1105,11 @@ app.delete('/api/documents/:id', async (req, res) => {
   }
 });
 
-// OBTENER PREGUNTAS CON RESULTADOS MATRICIALES INCLUIDOS PARA HISTORIAL
+// OBTENER PREGUNTAS ORDENADAS POR MÁS RECIENTES PRIMERO (ID DESC)
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
-    const [preguntas] = await db.query(`SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC, id ASC`, [assemblyId]);
+    const [preguntas] = await db.query(`SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY id DESC`, [assemblyId]);
     for (let p of preguntas) {
       const [opciones] = await db.query(`SELECT * FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`, [p.id]);
       p.opciones = opciones;
@@ -1219,7 +1242,6 @@ app.delete('/api/powers/:id', async (req, res) => {
   }
 });
 
-// ASIGNACIÓN MANUAL FLEXIBLE DE PODERES DESDE EL PANEL DE CONTROL / REPRESENTANTE
 app.post('/api/powers/manual', async (req, res) => {
   try {
     const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
@@ -1231,7 +1253,6 @@ app.post('/api/powers/manual', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Identificador del otorgante y del apoderado son requeridos.' });
     }
 
-    // Resolver Otorgante por ID numérico, identificador único o número de unidad
     let [otorganteRows] = await db.query(
       `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
       [targetAssembly, cleanOtorgante, cleanOtorgante, parseInt(cleanOtorgante) || 0]
@@ -1243,7 +1264,6 @@ app.post('/api/powers/manual', async (req, res) => {
 
     const otorganteNumId = otorganteRows[0].id;
 
-    // Resolver o Crear Apoderado
     let [apoderadoRows] = await db.query(
       `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
       [targetAssembly, cleanApoderado, cleanApoderado, parseInt(cleanApoderado) || 0]
@@ -1368,7 +1388,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
     );
 
     const [preguntas] = await db.query(
-      `SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC, id ASC`,
+      `SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY id DESC`,
       [id]
     );
 
@@ -1552,8 +1572,9 @@ io.on('connection', (socket) => {
 
       if (activeQuestions.has(targetAssembly)) {
         const activeQ = activeQuestions.get(targetAssembly);
+        const stats = await getVotingStats(targetAssembly, activeQ.id);
         const [votoUsuario] = await db.query(`SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`, [activeQ.id, userId]);
-        socket.emit('voting:current_state', { ...activeQ, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
+        socket.emit('voting:current_state', { ...activeQ, stats, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
       }
     } catch (error) {
       console.error('Error al autenticar socket:', error);
@@ -1585,7 +1606,8 @@ io.on('connection', (socket) => {
       if (preguntas.length === 0) return;
 
       const duracion = parseInt(duracionSegundos) || 60;
-      const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true };
+      const stats = await getVotingStats(assemblyId, preguntaId);
+      const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true, stats };
 
       activeQuestions.set(assemblyId, activeQData);
       const roomName = `assembly_${assemblyId}`;
@@ -1607,8 +1629,9 @@ io.on('connection', (socket) => {
 
           await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ?`, [preguntaId]);
           const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
+          const finalStats = await getVotingStats(assemblyId, preguntaId);
 
-          io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults });
+          io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults, stats: finalStats });
           io.to(roomName).emit('questions:updated');
           activeQuestions.delete(assemblyId);
         }
@@ -1631,9 +1654,10 @@ io.on('connection', (socket) => {
 
       await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
       const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
+      const finalStats = await getVotingStats(assemblyId, preguntaId);
 
       const roomName = `assembly_${assemblyId}`;
-      io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults });
+      io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults, stats: finalStats });
       io.to(roomName).emit('questions:updated');
     } catch (error) {
       console.error('Error al detener votación:', error);
@@ -1665,8 +1689,11 @@ io.on('connection', (socket) => {
         [assemblyId, currentQ.id, userId, opcionId, efCoef]
       );
       socket.emit('vote:confirmed', { opcionId });
+      
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
-      io.to(`assembly_${assemblyId}`).emit('voting:results_update', { preguntaId: currentQ.id, resultados: updatedResults });
+      const stats = await getVotingStats(assemblyId, currentQ.id);
+      
+      io.to(`assembly_${assemblyId}`).emit('voting:results_update', { preguntaId: currentQ.id, resultados: updatedResults, stats });
     } catch (error) {
       console.error('Error al registrar voto:', error);
     }
