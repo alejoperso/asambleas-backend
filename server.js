@@ -30,9 +30,92 @@ const socketUserMap = new Map();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA
+// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA COMPLETO (7 TABLAS DE SISTEMA)
 async function initDbSchema() {
   try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS asambleas (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        nombre_copropiedad VARCHAR(255) NOT NULL,
+        logo_url LONGTEXT NULL,
+        estado VARCHAR(50) DEFAULT 'programada',
+        zoom_embed_url LONGTEXT NULL,
+        zoom_meeting_id VARCHAR(100) NULL,
+        zoom_passcode VARCHAR(100) NULL,
+        zoom_password VARCHAR(100) NULL,
+        fecha_evento DATE NULL,
+        hora_inicio DATETIME NULL,
+        hora_cierre DATETIME NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS usuarios (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        assembly_id INT NOT NULL,
+        identificador_unico VARCHAR(100) NOT NULL,
+        nombre_completo VARCHAR(255) NOT NULL,
+        unidad VARCHAR(100) DEFAULT '---',
+        email VARCHAR(255) NULL,
+        password VARCHAR(255) NULL,
+        coeficiente DECIMAL(10,5) DEFAULT 0.00000,
+        rol VARCHAR(50) NOT NULL DEFAULT 'asistente',
+        estado VARCHAR(20) DEFAULT 'activo',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY idx_assembly_user (assembly_id, identificador_unico)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS preguntas (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        assembly_id INT NOT NULL,
+        texto_pregunta TEXT NOT NULL,
+        duracion_segundos INT DEFAULT 60,
+        estado VARCHAR(20) DEFAULT 'borrador',
+        orden INT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS opciones_pregunta (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        pregunta_id INT NOT NULL,
+        texto_opcion VARCHAR(255) NOT NULL,
+        orden INT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS votos (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        assembly_id INT NOT NULL,
+        pregunta_id INT NOT NULL,
+        usuario_id INT NOT NULL,
+        opcion_id INT NOT NULL,
+        coeficiente_aplicado DECIMAL(10,5) NOT NULL DEFAULT 0.00000,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY idx_user_question (pregunta_id, usuario_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS poderes (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        assembly_id INT NOT NULL,
+        otorgante_id INT NOT NULL,
+        apoderado_id INT NOT NULL,
+        documento_url LONGTEXT NULL,
+        estado VARCHAR(20) DEFAULT 'pendiente',
+        observaciones TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY idx_otorgante_assembly (assembly_id, otorgante_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
     await db.query(`
       CREATE TABLE IF NOT EXISTS documentos (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -40,7 +123,7 @@ async function initDbSchema() {
         titulo VARCHAR(255) NOT NULL,
         archivo_url LONGTEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
     await db.query(`
@@ -52,7 +135,7 @@ async function initDbSchema() {
         rol VARCHAR(50) DEFAULT 'superadmin',
         estado VARCHAR(20) DEFAULT 'activo',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
     const alterQueries = [
@@ -66,7 +149,7 @@ async function initDbSchema() {
         await db.query(q);
       } catch (e) {}
     }
-    console.log('✅ Verificación y migración de esquema completada.');
+    console.log('✅ Verificación y migración completa de las 7 tablas de base de datos.');
   } catch (err) {
     console.warn('Advertencia en verificación de esquema:', err.message);
   }
@@ -354,7 +437,7 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
   }
 });
 
-// ENVIAR CORREO CON CREDENCIALES AL PERSONAL DE CONTROL (ADMIN, MODERADOR, SOPORTE)
+// ENVIAR CORREO CON CREDENCIALES AL PERSONAL DE CONTROL
 app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
@@ -978,14 +1061,22 @@ app.post('/api/documents', async (req, res) => {
 app.delete('/api/documents/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    let targetAssembly = 1;
+
     try {
+      const [doc] = await db.query(`SELECT assembly_id FROM documentos WHERE id = ?`, [id]);
+      if (doc.length > 0) targetAssembly = doc[0].assembly_id;
       await db.query(`DELETE FROM documentos WHERE id = ?`, [id]);
     } catch (e) {
       const idx = memoryDocuments.findIndex(d => d.id == id);
-      if (idx !== -1) memoryDocuments.splice(idx, 1);
+      if (idx !== -1) {
+        targetAssembly = memoryDocuments[idx].assemblyId || 1;
+        memoryDocuments.splice(idx, 1);
+      }
     }
-    io.to(`assembly_1`).emit('documents:updated');
-    res.json({ ok: true });
+
+    io.to(`assembly_${targetAssembly}`).emit('documents:updated');
+    res.json({ ok: true, message: 'Documento eliminado exitosamente.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1124,15 +1215,34 @@ app.delete('/api/powers/:id', async (req, res) => {
   }
 });
 
+// ASIGNACIÓN MANUAL FLEXIBLE DE PODERES DESDE EL PANEL DE CONTROL / REPRESENTANTE
 app.post('/api/powers/manual', async (req, res) => {
   try {
     const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
-    const targetAssembly = assemblyId || 1;
-    const targetApoderadoId = apoderadoIdentificador.toString().trim().toUpperCase();
+    const targetAssembly = parseInt(assemblyId) || 1;
+    const cleanOtorgante = (otorganteId || '').toString().trim().toUpperCase();
+    const cleanApoderado = (apoderadoIdentificador || '').toString().trim().toUpperCase();
 
+    if (!cleanOtorgante || !cleanApoderado) {
+      return res.status(400).json({ ok: false, error: 'Identificador del otorgante y del apoderado son requeridos.' });
+    }
+
+    // Resolver Otorgante por ID numérico, identificador único o número de unidad
+    let [otorganteRows] = await db.query(
+      `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
+      [targetAssembly, cleanOtorgante, cleanOtorgante, parseInt(cleanOtorgante) || 0]
+    );
+
+    if (otorganteRows.length === 0) {
+      return res.status(404).json({ ok: false, error: `El inmueble/otorgante [${cleanOtorgante}] no fue encontrado en la base de datos.` });
+    }
+
+    const otorganteNumId = otorganteRows[0].id;
+
+    // Resolver o Crear Apoderado
     let [apoderadoRows] = await db.query(
-      `SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-      [targetAssembly, targetApoderadoId]
+      `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
+      [targetAssembly, cleanApoderado, cleanApoderado, parseInt(cleanApoderado) || 0]
     );
 
     let apoderadoNumId;
@@ -1140,24 +1250,29 @@ app.post('/api/powers/manual', async (req, res) => {
       const [ins] = await db.query(
         `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
          VALUES (?, ?, ?, 'Apoderado Externo', 0.00000, 'asistente')`,
-        [targetAssembly, targetApoderadoId, apoderadoNombre || 'Apoderado Externo']
+        [targetAssembly, cleanApoderado, apoderadoNombre || cleanApoderado]
       );
       apoderadoNumId = ins.insertId;
     } else {
       apoderadoNumId = apoderadoRows[0].id;
     }
 
+    if (otorganteNumId === apoderadoNumId) {
+      return res.status(400).json({ ok: false, error: 'El otorgante y el apoderado no pueden ser la misma persona.' });
+    }
+
     await db.query(
       `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado, observaciones)
-       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMIN', 'autorizado', 'Asignado manualmente')
+       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMIN', 'autorizado', 'Asignado manualmente por Representante/Admin')
        ON DUPLICATE KEY UPDATE apoderado_id = VALUES(apoderado_id), estado = 'autorizado'`,
-      [targetAssembly, otorganteId, apoderadoNumId]
+      [targetAssembly, otorganteNumId, apoderadoNumId]
     );
 
     await updateAndBroadcastQuorum(targetAssembly);
     io.to(`assembly_${targetAssembly}`).emit('powers:updated');
-    res.json({ ok: true, message: 'Poder asignado correctamente.' });
+    res.json({ ok: true, message: 'Poder asignado y autorizado correctamente.' });
   } catch (err) {
+    console.error('Error en asignar poder manual:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
