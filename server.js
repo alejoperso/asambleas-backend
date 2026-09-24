@@ -16,9 +16,10 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] } });
 
-// CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN
+// CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN Y CLAVE SECRETA
 const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL || 'contacto@ajaudiovisual.com';
 const SUPERADMIN_PASSWORD = process.env.SUPERADMIN_PASSWORD || 'Alfaleon2030';
+const SECRET_KEY = process.env.JWT_SECRET || 'AsambleasPH_Secret_Token_2026';
 
 // INICIALIZACIÓN DE RESEND CON API KEY
 const resend = new Resend(process.env.RESEND_API_KEY || 're_dummy_key');
@@ -29,6 +30,45 @@ const activeSessions = new Map();
 const socketUserMap = new Map();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// HELPER PARA GENERAR TOKENS SEGUROS DE ACCIÓN EN PODERES
+function generatePowerActionToken(powerId, action) {
+  return crypto
+    .createHmac('sha256', SECRET_KEY)
+    .update(`${powerId}_${action}`)
+    .digest('hex');
+}
+
+// HELPER PARA RENDERIZAR RESPUESTA HTML AL REPRESENTANTE LEGAL
+function renderResponseHTML(title, message, isSuccess, headerColor = '#6366f1') {
+  return `
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>${title}</title>
+      <style>
+        body { font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+        .card { background-color: #1e293b; border-radius: 16px; padding: 32px; max-width: 480px; width: 100%; text-align: center; border: 1px solid #334155; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
+        .badge { display: inline-block; padding: 8px 16px; border-radius: 9999px; font-weight: bold; font-size: 14px; margin-bottom: 16px; color: #fff; background-color: ${headerColor}; }
+        h1 { font-size: 20px; margin-bottom: 12px; color: #ffffff; }
+        p { font-size: 14px; color: #94a3b8; line-height: 1.6; margin-bottom: 24px; }
+        .btn { display: inline-block; background-color: #334155; color: #f1f5f9; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: bold; }
+        .btn:hover { background-color: #475569; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="badge">${isSuccess ? '✓ OPERACIÓN EXITOSA' : '✕ ALERTA DE SISTEMA'}</div>
+        <h1>${title}</h1>
+        <p>${message}</p>
+        <a href="javascript:window.close();" class="btn">Cerrar esta ventana</a>
+      </div>
+    </body>
+    </html>
+  `;
+}
 
 // MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA COMPLETO (7 TABLAS DE SISTEMA)
 async function initDbSchema() {
@@ -1240,6 +1280,55 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
   }
 });
 
+// ACCIÓN RÁPIDA DE APROBACIÓN / RECHAZO DESDE EL CORREO DEL REPRESENTANTE LEGAL
+app.get('/api/powers/:id/quick-action', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, token } = req.query;
+
+    if (!id || !status || !token) {
+      return res.status(400).send(renderResponseHTML('Error de Solicitud', 'Parámetros incompletos en el enlace.', false));
+    }
+
+    const expectedToken = generatePowerActionToken(id, status);
+    if (token !== expectedToken) {
+      return res.status(403).send(renderResponseHTML('Enlace Inválido', 'El token de seguridad no es válido o ha expirado.', false));
+    }
+
+    const [podRows] = await db.query(
+      `SELECT p.id, p.assembly_id, p.estado, u_ot.nombre_completo AS otorgante, u_ap.nombre_completo AS apoderado 
+       FROM poderes p
+       JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
+       JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
+       WHERE p.id = ?`,
+      [id]
+    );
+
+    if (podRows.length === 0) {
+      return res.status(404).send(renderResponseHTML('No Encontrado', 'El poder especificado no existe.', false));
+    }
+
+    const poder = podRows[0];
+    const nuevoEstado = status === 'autorizado' ? 'autorizado' : 'rechazado';
+    const observacion = `Procesado mediante acción directa desde correo electrónico el ${new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' })}`;
+
+    await db.query(`UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`, [nuevoEstado, observacion, id]);
+
+    await updateAndBroadcastQuorum(poder.assembly_id);
+    io.to(`assembly_${poder.assembly_id}`).emit('powers:updated');
+
+    const colorHeader = nuevoEstado === 'autorizado' ? '#10b981' : '#ef4444';
+    const tituloResultado = nuevoEstado === 'autorizado' ? 'Poder Aprobado y Autorizado' : 'Poder Rechazado';
+    const mensajeDetalle = `El poder otorgado por <strong>${poder.otorgante}</strong> a favor de <strong>${poder.apoderado}</strong> ha sido marcado como <strong>${nuevoEstado.toUpperCase()}</strong> correctamente.`;
+
+    return res.send(renderResponseHTML(tituloResultado, mensajeDetalle, true, colorHeader));
+
+  } catch (err) {
+    console.error('Error en quick-action poder:', err);
+    return res.status(500).send(renderResponseHTML('Error Interno', 'No se pudo procesar la solicitud.', false));
+  }
+});
+
 app.put('/api/powers/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1334,7 +1423,7 @@ app.post('/api/powers/manual', async (req, res) => {
   }
 });
 
-// CARGA DE PODERES POR PARTE DE USUARIOS CON NOTIFICACIÓN Y ADJUNTO AL REPRESENTANTE LEGAL
+// CARGA DE PODERES POR PARTE DE USUARIOS CON BOTONES DE ACCIÓN DIRECTA AL CORREO DEL REPRESENTANTE
 app.post('/api/powers', async (req, res) => {
   try {
     const { assemblyId, otorganteUnico, apoderadoUnico, documentoUrl } = req.body;
@@ -1357,14 +1446,15 @@ app.post('/api/powers', async (req, res) => {
     const otorganteUser = otorgantes[0];
     const apoderadoUser = apoderados[0];
 
-    await db.query(
+    const [resultPoder] = await db.query(
       `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado) VALUES (?, ?, ?, ?, 'pendiente')`,
       [targetAssembly, otorganteUser.id, apoderadoUser.id, documentoUrl]
     );
 
+    const powerId = resultPoder.insertId;
     io.to(`assembly_${targetAssembly}`).emit('powers:updated');
 
-    // NOTIFICACIÓN AUTOMÁTICA VÍA CORREO ELECTRÓNICO CON ADJUNTO AL REPRESENTANTE LEGAL / ADMINISTRADOR
+    // NOTIFICACIÓN AUTOMÁTICA CON BOTONES DE APROBACIÓN/RECHAZO EN EL CORREO
     try {
       const [reps] = await db.query(
         `SELECT email, nombre_completo FROM usuarios 
@@ -1378,6 +1468,13 @@ app.post('/api/powers', async (req, res) => {
       if (reps.length > 0) {
         const emailsDestino = reps.map(r => r.email);
         const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
+        const serverBaseUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
+
+        const tokenApprove = generatePowerActionToken(powerId, 'autorizado');
+        const tokenReject = generatePowerActionToken(powerId, 'rechazado');
+
+        const approveLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=autorizado&token=${tokenApprove}`;
+        const rejectLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=rechazado&token=${tokenReject}`;
 
         // Preparar el archivo adjunto para Resend
         let attachments = [];
@@ -1401,7 +1498,7 @@ app.post('/api/powers', async (req, res) => {
           from: `${nombreCopropiedad} <${fromSender}>`,
           to: emailsDestino,
           subject: `🚨 Alerta: Nuevo Poder Pendiente por Autorizar - ${nombreCopropiedad}`,
-          text: `Atención Representante Legal, se ha recibido un nuevo poder pendiente por aprobación.\nOtorgante: ${otorganteUser.nombre_completo} (${otorganteUser.unidad})\nApoderado: ${apoderadoUser.nombre_completo} (${apoderadoUser.unidad})`,
+          text: `Atención Representante Legal, se ha recibido un nuevo poder pendiente por aprobación.\nOtorgante: ${otorganteUser.nombre_completo} (${otorganteUser.unidad})\nApoderado: ${apoderadoUser.nombre_completo} (${apoderadoUser.unidad})\nAprobar: ${approveLink}\nRechazar: ${rejectLink}`,
           html: `
             <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
               <h2 style="color: #f59e0b; text-align: center; margin-bottom: 20px;">⚠️ Nuevo Poder Pendiente de Autorización</h2>
@@ -1414,11 +1511,21 @@ app.post('/api/powers', async (req, res) => {
                 <p style="margin: 6px 0; font-size: 14px;"><strong>Estado:</strong> <span style="color: #f59e0b; font-weight: bold;">PENDIENTE DE REVISIÓN</span></p>
               </div>
 
-              <p style="font-size: 13px; color: #cbd5e1; line-height: 1.6;">
-                Adjunto a este correo encontrará el documento original del poder radicado. Ingrese a la consola de administración si desea aprobar o rechazar esta solicitud.
+              <!-- BOTONES DE ACCIÓN DIRECTA -->
+              <div style="text-align: center; margin: 25px 0;">
+                <a href="${approveLink}" target="_blank" style="background-color: #10b981; color: #ffffff; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block; margin-right: 10px; font-size: 14px;">
+                  ✓ APROBAR PODER
+                </a>
+                <a href="${rejectLink}" target="_blank" style="background-color: #ef4444; color: #ffffff; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block; font-size: 14px;">
+                  ✕ RECHAZAR PODER
+                </a>
+              </div>
+
+              <p style="font-size: 12px; color: #cbd5e1; line-height: 1.6; text-align: center;">
+                El documento adjunto se encuentra disponible en este correo. Puede hacer clic en cualquiera de los botones superiores para autorizar o rechazar este poder de manera inmediata.
               </p>
 
-              <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
+              <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
                 Notificación automática del Sistema de Asambleas Virtuales.
               </p>
             </div>
