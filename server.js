@@ -291,16 +291,40 @@ async function updateAndBroadcastQuorum(assemblyId) {
 
 async function getVotingStats(assemblyId, preguntaId) {
   try {
-    const activeUserIds = new Set();
+    const rawActiveUserIds = new Set();
     for (const [key, session] of activeSessions.entries()) {
       if (session.assemblyId === parseInt(assemblyId)) {
-        activeUserIds.add(session.userId);
+        rawActiveUserIds.add(session.userId);
       }
     }
-    const totalConectados = activeUserIds.size;
 
+    // Calcular cuántos inmuebles/unidades con coeficiente efectivomente habilitado están presentes
+    let totalConectados = 0;
+    for (const uId of rawActiveUserIds) {
+      const { isRepresented } = await checkUserRepresentedStatus(uId, assemblyId);
+      if (isRepresented) continue;
+
+      const [u] = await db.query(`SELECT coeficiente, rol FROM usuarios WHERE id = ?`, [uId]);
+      if (u.length === 0 || u[0].rol === 'soporte') continue;
+
+      const propioCoef = parseFloat(u[0].coeficiente) || 0;
+      if (propioCoef > 0) {
+        totalConectados += 1;
+      }
+
+      const { representadosAprobados } = await getUserPowerDetails(uId, assemblyId);
+      if (representadosAprobados && representadosAprobados.length > 0) {
+        for (const rep of representadosAprobados) {
+          if ((parseFloat(rep.coeficiente) || 0) > 0) {
+            totalConectados += 1;
+          }
+        }
+      }
+    }
+
+    // Contar únicamente votos registrados con coeficiente_aplicado > 0
     const [rows] = await db.query(
-      `SELECT COUNT(DISTINCT usuario_id) AS totalVotaron FROM votos WHERE assembly_id = ? AND pregunta_id = ?`,
+      `SELECT COUNT(DISTINCT usuario_id) AS totalVotaron FROM votos WHERE assembly_id = ? AND pregunta_id = ? AND coeficiente_aplicado > 0`,
       [assemblyId, preguntaId]
     );
     const hanVotado = rows[0] ? parseInt(rows[0].totalVotaron) || 0 : 0;
