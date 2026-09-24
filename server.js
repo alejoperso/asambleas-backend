@@ -1082,13 +1082,17 @@ app.delete('/api/documents/:id', async (req, res) => {
   }
 });
 
+// OBTENER PREGUNTAS CON RESULTADOS MATRICIALES INCLUIDOS PARA HISTORIAL
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
-    const [preguntas] = await db.query(`SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC`, [assemblyId]);
+    const [preguntas] = await db.query(`SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC, id ASC`, [assemblyId]);
     for (let p of preguntas) {
       const [opciones] = await db.query(`SELECT * FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`, [p.id]);
       p.opciones = opciones;
+      if (p.estado === 'cerrada' || p.estado === 'activa') {
+        p.resultados = await calculateWeightedResults(assemblyId, p.id);
+      }
     }
     res.json({ ok: true, preguntas });
   } catch (err) {
@@ -1662,7 +1666,7 @@ io.on('connection', (socket) => {
       );
       socket.emit('vote:confirmed', { opcionId });
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
-      io.to(`assembly_${assemblyId}`).emit('voting:results_update', { resultados: updatedResults });
+      io.to(`assembly_${assemblyId}`).emit('voting:results_update', { preguntaId: currentQ.id, resultados: updatedResults });
     } catch (error) {
       console.error('Error al registrar voto:', error);
     }
