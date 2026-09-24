@@ -281,7 +281,6 @@ async function updateAndBroadcastQuorum(assemblyId) {
 
     const quorumPercentage = totalQuorum.toFixed(4);
     
-    // Broadcast Quórum y Lista en Tiempo Real de Conectados
     io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
     io.to(`assembly_${assemblyId}`).emit('users:connected_update', { total: activeList.length, usuarios: activeList });
   } catch (err) {
@@ -298,7 +297,6 @@ async function getVotingStats(assemblyId, preguntaId) {
       }
     }
 
-    // Calcular cuántos inmuebles/unidades con coeficiente efectivomente habilitado están presentes
     let totalConectados = 0;
     for (const uId of rawActiveUserIds) {
       const { isRepresented } = await checkUserRepresentedStatus(uId, assemblyId);
@@ -322,7 +320,6 @@ async function getVotingStats(assemblyId, preguntaId) {
       }
     }
 
-    // Contar únicamente votos registrados con coeficiente_aplicado > 0
     const [rows] = await db.query(
       `SELECT COUNT(DISTINCT usuario_id) AS totalVotaron FROM votos WHERE assembly_id = ? AND pregunta_id = ? AND coeficiente_aplicado > 0`,
       [assemblyId, preguntaId]
@@ -1139,7 +1136,6 @@ app.delete('/api/documents/:id', async (req, res) => {
   }
 });
 
-// OBTENER PREGUNTAS ORDENADAS POR MÁS RECIENTES PRIMERO (ID DESC)
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1207,7 +1203,6 @@ app.put('/api/questions/:id', async (req, res) => {
   }
 });
 
-// ELIMINAR PREGUNTA POR PARTE DE MODERADOR/ADMINISTRADOR
 app.delete('/api/questions/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1339,21 +1334,103 @@ app.post('/api/powers/manual', async (req, res) => {
   }
 });
 
+// CARGA DE PODERES POR PARTE DE USUARIOS CON NOTIFICACIÓN Y ADJUNTO AL REPRESENTANTE LEGAL
 app.post('/api/powers', async (req, res) => {
   try {
     const { assemblyId, otorganteUnico, apoderadoUnico, documentoUrl } = req.body;
-    const [otorgantes] = await db.query(`SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`, [assemblyId || 1, otorganteUnico.toString().trim().toUpperCase()]);
-    const [apoderados] = await db.query(`SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`, [assemblyId || 1, apoderadoUnico.toString().trim().toUpperCase()]);
+    const targetAssembly = parseInt(assemblyId) || 1;
+    const cleanOtorgante = (otorganteUnico || '').toString().trim().toUpperCase();
+    const cleanApoderado = (apoderadoUnico || '').toString().trim().toUpperCase();
+
+    const [otorgantes] = await db.query(
+      `SELECT id, nombre_completo, unidad FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
+      [targetAssembly, cleanOtorgante]
+    );
+    const [apoderados] = await db.query(
+      `SELECT id, nombre_completo, unidad FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
+      [targetAssembly, cleanApoderado]
+    );
 
     if (otorgantes.length === 0) return res.status(400).json({ ok: false, error: 'El otorgante no existe.' });
     if (apoderados.length === 0) return res.status(400).json({ ok: false, error: 'El apoderado no existe.' });
 
+    const otorganteUser = otorgantes[0];
+    const apoderadoUser = apoderados[0];
+
     await db.query(
       `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado) VALUES (?, ?, ?, ?, 'pendiente')`,
-      [assemblyId || 1, otorgantes[0].id, apoderados[0].id, documentoUrl]
+      [targetAssembly, otorganteUser.id, apoderadoUser.id, documentoUrl]
     );
-    io.to(`assembly_${assemblyId || 1}`).emit('powers:updated');
-    res.json({ ok: true });
+
+    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
+
+    // NOTIFICACIÓN AUTOMÁTICA VÍA CORREO ELECTRÓNICO CON ADJUNTO AL REPRESENTANTE LEGAL / ADMINISTRADOR
+    try {
+      const [reps] = await db.query(
+        `SELECT email, nombre_completo FROM usuarios 
+         WHERE assembly_id = ? AND rol IN ('representante_legal', 'administrador') AND email IS NOT NULL AND email != ''`,
+        [targetAssembly]
+      );
+
+      const [asamblea] = await db.query(`SELECT nombre_copropiedad FROM asambleas WHERE id = ?`, [targetAssembly]);
+      const nombreCopropiedad = asamblea.length > 0 ? asamblea[0].nombre_copropiedad : 'Asamblea Virtual';
+
+      if (reps.length > 0) {
+        const emailsDestino = reps.map(r => r.email);
+        const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
+
+        // Preparar el archivo adjunto para Resend
+        let attachments = [];
+        if (documentoUrl && documentoUrl.startsWith('data:')) {
+          const matches = documentoUrl.match(/^data:(.+);base64,(.+)$/);
+          if (matches) {
+            const mimeType = matches[1];
+            const base64Content = matches[2];
+            let ext = 'pdf';
+            if (mimeType.includes('png')) ext = 'png';
+            else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) ext = 'jpg';
+
+            attachments.push({
+              filename: `Poder_${cleanOtorgante}_a_${cleanApoderado}.${ext}`,
+              content: Buffer.from(base64Content, 'base64')
+            });
+          }
+        }
+
+        await resend.emails.send({
+          from: `${nombreCopropiedad} <${fromSender}>`,
+          to: emailsDestino,
+          subject: `🚨 Alerta: Nuevo Poder Pendiente por Autorizar - ${nombreCopropiedad}`,
+          text: `Atención Representante Legal, se ha recibido un nuevo poder pendiente por aprobación.\nOtorgante: ${otorganteUser.nombre_completo} (${otorganteUser.unidad})\nApoderado: ${apoderadoUser.nombre_completo} (${apoderadoUser.unidad})`,
+          html: `
+            <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
+              <h2 style="color: #f59e0b; text-align: center; margin-bottom: 20px;">⚠️ Nuevo Poder Pendiente de Autorización</h2>
+              <p style="font-size: 14px; line-height: 1.6;">Estimado(a) Representante Legal / Administrador,</p>
+              <p style="font-size: 14px; line-height: 1.6;">Se ha radicado una solicitud de poder en la plataforma para la copropiedad <strong>${nombreCopropiedad}</strong>.</p>
+              
+              <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #f59e0b; margin: 20px 0;">
+                <p style="margin: 6px 0; font-size: 14px;"><strong>Otorgante:</strong> ${otorganteUser.nombre_completo} (Unidad: ${otorganteUser.unidad})</p>
+                <p style="margin: 6px 0; font-size: 14px;"><strong>Apoderado:</strong> ${apoderadoUser.nombre_completo} (Unidad: ${apoderadoUser.unidad})</p>
+                <p style="margin: 6px 0; font-size: 14px;"><strong>Estado:</strong> <span style="color: #f59e0b; font-weight: bold;">PENDIENTE DE REVISIÓN</span></p>
+              </div>
+
+              <p style="font-size: 13px; color: #cbd5e1; line-height: 1.6;">
+                Adjunto a este correo encontrará el documento original del poder radicado. Ingrese a la consola de administración si desea aprobar o rechazar esta solicitud.
+              </p>
+
+              <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
+                Notificación automática del Sistema de Asambleas Virtuales.
+              </p>
+            </div>
+          `,
+          attachments: attachments
+        });
+      }
+    } catch (emailErr) {
+      console.error('Error al enviar correo de alerta de poder al representante:', emailErr);
+    }
+
+    res.json({ ok: true, message: 'Poder registrado exitosamente y notificación enviada al representante legal.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1702,7 +1779,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // EMISIÓN DE VOTO CON REGISTRO MULTIPLICADO POR PODERES (1 PODER = 2 VOTOS EN RESUMEN)
   socket.on('vote:submit', async ({ opcionId }) => {
     const { assemblyId, userId } = socket;
     if (!assemblyId || !userId) return;
@@ -1716,7 +1792,6 @@ io.on('connection', (socket) => {
         return socket.emit('vote:rejected', { message: `No puedes votar directamente. Tus derechos de voto están delegados por poder autorizado a ${apoderadoNombre}.` });
       }
 
-      // 1. Obtener otorgantes representados con poder autorizado
       const [poderesAprobados] = await db.query(
         `SELECT p.otorgante_id, u.coeficiente
          FROM poderes p
@@ -1725,13 +1800,11 @@ io.on('connection', (socket) => {
         [userId, assemblyId]
       );
 
-      // 2. Obtener datos del votante actual
       const [u] = await db.query(`SELECT id, coeficiente, rol FROM usuarios WHERE id = ?`, [userId]);
       if (u.length === 0) return;
 
       const voterList = [];
 
-      // Si el votante no es de soporte y tiene inmueble propio o poderes, se incluye a sí mismo
       if (u[0].rol !== 'soporte') {
         const propioCoef = parseFloat(u[0].coeficiente) || 0;
         if (propioCoef > 0 || poderesAprobados.length === 0) {
@@ -1739,7 +1812,6 @@ io.on('connection', (socket) => {
         }
       }
 
-      // Agregar a cada otorgante representado para que su voto cuente de forma individual
       for (const pod of poderesAprobados) {
         voterList.push({ usuarioId: pod.otorgante_id, coef: parseFloat(pod.coeficiente) || 0 });
       }
@@ -1748,7 +1820,6 @@ io.on('connection', (socket) => {
         return socket.emit('vote:rejected', { message: 'Tu coeficiente habilitado de voto es 0.0000%.' });
       }
 
-      // Registrar los votos individuales (Inmueble propio + Inmuebles Representados)
       for (const target of voterList) {
         await db.query(
           `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
