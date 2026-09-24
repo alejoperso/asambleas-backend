@@ -256,24 +256,34 @@ async function getUserEffectiveCoefficient(userId, assemblyId) {
 
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
+    const activeList = [];
     const activeUserIds = new Set();
+    
     for (const [key, session] of activeSessions.entries()) {
       if (session.assemblyId === parseInt(assemblyId)) {
         activeUserIds.add(session.userId);
+        activeList.push({
+          userId: session.userId,
+          identificadorUnico: session.identificadorUnico,
+          nombreCompleto: session.nombreCompleto,
+          unidad: session.unidad,
+          rol: session.rol
+        });
       }
     }
 
-    if (activeUserIds.size === 0) {
-      io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage: "0.0000" });
-      return;
+    let totalQuorum = 0;
+    if (activeUserIds.size > 0) {
+      for (let uId of activeUserIds) {
+        totalQuorum += await getUserEffectiveCoefficient(uId, assemblyId);
+      }
     }
 
-    let totalQuorum = 0;
-    for (let uId of activeUserIds) {
-      totalQuorum += await getUserEffectiveCoefficient(uId, assemblyId);
-    }
     const quorumPercentage = totalQuorum.toFixed(4);
+    
+    // Broadcast Quórum y Lista en Tiempo Real de Conectados
     io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
+    io.to(`assembly_${assemblyId}`).emit('users:connected_update', { total: activeList.length, usuarios: activeList });
   } catch (err) {
     console.error('Error calculando quórum:', err);
   }
@@ -1173,15 +1183,19 @@ app.put('/api/questions/:id', async (req, res) => {
   }
 });
 
+// ELIMINAR PREGUNTA POR PARTE DE MODERADOR/ADMINISTRADOR
 app.delete('/api/questions/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { assemblyId } = req.query;
+
     await db.query(`DELETE FROM votos WHERE pregunta_id = ?`, [id]);
     await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id = ?`, [id]);
     await db.query(`DELETE FROM preguntas WHERE id = ?`, [id]);
-    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
-    res.json({ ok: true, message: 'Pregunta eliminada.' });
+
+    const targetAssembly = assemblyId || 1;
+    io.to(`assembly_${targetAssembly}`).emit('questions:updated');
+    res.json({ ok: true, message: 'Pregunta y sus votos fueron eliminados correctamente.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1497,7 +1511,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.0.0-master' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.1.0-master' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -1664,6 +1678,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // EMISIÓN DE VOTO CON REGISTRO MULTIPLICADO POR PODERES (1 PODER = 2 VOTOS EN RESUMEN)
   socket.on('vote:submit', async ({ opcionId }) => {
     const { assemblyId, userId } = socket;
     if (!assemblyId || !userId) return;
@@ -1677,17 +1692,48 @@ io.on('connection', (socket) => {
         return socket.emit('vote:rejected', { message: `No puedes votar directamente. Tus derechos de voto están delegados por poder autorizado a ${apoderadoNombre}.` });
       }
 
-      const efCoef = await getUserEffectiveCoefficient(userId, assemblyId);
-      if (efCoef <= 0) {
+      // 1. Obtener otorgantes representados con poder autorizado
+      const [poderesAprobados] = await db.query(
+        `SELECT p.otorgante_id, u.coeficiente
+         FROM poderes p
+         JOIN usuarios u ON p.otorgante_id = u.id
+         WHERE p.apoderado_id = ? AND p.assembly_id = ? AND p.estado = 'autorizado'`,
+        [userId, assemblyId]
+      );
+
+      // 2. Obtener datos del votante actual
+      const [u] = await db.query(`SELECT id, coeficiente, rol FROM usuarios WHERE id = ?`, [userId]);
+      if (u.length === 0) return;
+
+      const voterList = [];
+
+      // Si el votante no es de soporte y tiene inmueble propio o poderes, se incluye a sí mismo
+      if (u[0].rol !== 'soporte') {
+        const propioCoef = parseFloat(u[0].coeficiente) || 0;
+        if (propioCoef > 0 || poderesAprobados.length === 0) {
+          voterList.push({ usuarioId: u[0].id, coef: propioCoef });
+        }
+      }
+
+      // Agregar a cada otorgante representado para que su voto cuente de forma individual
+      for (const pod of poderesAprobados) {
+        voterList.push({ usuarioId: pod.otorgante_id, coef: parseFloat(pod.coeficiente) || 0 });
+      }
+
+      if (voterList.length === 0) {
         return socket.emit('vote:rejected', { message: 'Tu coeficiente habilitado de voto es 0.0000%.' });
       }
 
-      await db.query(
-        `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
-         VALUES (?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE opcion_id = VALUES(opcion_id), coeficiente_aplicado = VALUES(coeficiente_aplicado)`,
-        [assemblyId, currentQ.id, userId, opcionId, efCoef]
-      );
+      // Registrar los votos individuales (Inmueble propio + Inmuebles Representados)
+      for (const target of voterList) {
+        await db.query(
+          `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
+           VALUES (?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE opcion_id = VALUES(opcion_id), coeficiente_aplicado = VALUES(coeficiente_aplicado)`,
+          [assemblyId, currentQ.id, target.usuarioId, opcionId, target.coef]
+        );
+      }
+
       socket.emit('vote:confirmed', { opcionId });
       
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
@@ -1712,4 +1758,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.0.0-master corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.1.0-master corriendo en puerto ${PORT}`));
