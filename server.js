@@ -573,7 +573,7 @@ app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
     const adminUrl = `${clientUrl}/admin.html?asamblea=${user.assembly_id || 1}`;
     const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
     const copropiedadNombre = user.nombre_copropiedad || 'Asamblea Virtual';
-    const rolNombre = user.rol === 'administrador' ? 'Administrador' : user.rol === 'moderador' ? 'Moderador' : 'Soporte Técnico';
+    const rolNombre = user.rol === 'administrador' ? 'Administrador' : user.rol === 'moderador' ? 'Moderador' : user.rol === 'representante_legal' ? 'Representante Legal' : 'Soporte Técnico';
 
     const emailResult = await resend.emails.send({
       from: `Plataforma Asambleas <${fromSender}>`,
@@ -1266,6 +1266,7 @@ app.delete('/api/questions/:id', async (req, res) => {
   }
 });
 
+// OBTENCIÓN DE PODERES CALCULANDO EL COEFICIENTE EFECTIVO TOTAL ACUMULADO DEL APODERADO
 app.get('/api/powers/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1280,6 +1281,11 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
        ORDER BY p.created_at DESC`,
       [assemblyId]
     );
+
+    for (let pod of poderes) {
+      pod.apoderado_coef_efectivo = await getUserEffectiveCoefficient(pod.apoderado_num_id, assemblyId);
+    }
+
     res.json({ ok: true, poderes });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1548,6 +1554,7 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
+// OBTENCIÓN DE USUARIOS CON SU COEFICIENTE EFECTIVO TOTAL
 app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1565,6 +1572,11 @@ app.get('/api/users/:assemblyId', async (req, res) => {
       sql += ` LIMIT 50`;
     }
     const [usuarios] = await db.query(sql, params);
+
+    for (let u of usuarios) {
+      u.coeficiente_efectivo = await getUserEffectiveCoefficient(u.id, assemblyId);
+    }
+
     res.json({ ok: true, usuarios });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
