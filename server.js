@@ -1476,7 +1476,6 @@ app.post('/api/powers', async (req, res) => {
         const approveLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=autorizado&token=${tokenApprove}`;
         const rejectLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=rechazado&token=${tokenReject}`;
 
-        // Preparar el archivo adjunto para Resend
         let attachments = [];
         if (documentoUrl && documentoUrl.startsWith('data:')) {
           const matches = documentoUrl.match(/^data:(.+);base64,(.+)$/);
@@ -1737,6 +1736,18 @@ io.on('connection', (socket) => {
          WHERE assembly_id = ? AND (LOWER(email) = ? OR UPPER(identificador_unico) = ?)`,
         [targetAssembly, targetEmail || targetId.toLowerCase(), targetId]
       );
+
+      // Bypass automático para Superadmin
+      if (rows.length === 0 && (targetId === 'SUPERADMIN' || targetId.startsWith('ADMIN-') || targetEmail === SUPERADMIN_EMAIL.toLowerCase())) {
+        rows = [{
+          id: 0,
+          identificador_unico: 'SUPERADMIN',
+          nombre_completo: 'Super Administrador',
+          unidad: 'CONTROL',
+          coeficiente: 0.00000,
+          rol: 'superadmin'
+        }];
+      }
 
       if (rows.length === 0 && targetId.startsWith('SOPORTE')) {
         const [ins] = await db.query(
