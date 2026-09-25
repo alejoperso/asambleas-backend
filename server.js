@@ -282,6 +282,7 @@ async function getUserPowerDetails(userId, assemblyId) {
 }
 
 async function getUserEffectiveCoefficient(userId, assemblyId) {
+  if (!userId || userId === 0) return 0;
   const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
   if (isRepresented) return 0;
 
@@ -294,6 +295,7 @@ async function getUserEffectiveCoefficient(userId, assemblyId) {
   return propio + coefPoderes;
 }
 
+// CÁLCULO Y TRANSMISIÓN EXACTA DEL QUÓRUM Y DE LOS COEFICIENTES EN VIVO
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
     const activeList = [];
@@ -302,12 +304,16 @@ async function updateAndBroadcastQuorum(assemblyId) {
     for (const [key, session] of activeSessions.entries()) {
       if (session.assemblyId === parseInt(assemblyId)) {
         activeUserIds.add(session.userId);
+
+        const coefEfectivo = await getUserEffectiveCoefficient(session.userId, assemblyId);
+
         activeList.push({
           userId: session.userId,
           identificadorUnico: session.identificadorUnico,
           nombreCompleto: session.nombreCompleto,
           unidad: session.unidad,
-          rol: session.rol
+          rol: session.rol,
+          coeficiente: coefEfectivo
         });
       }
     }
