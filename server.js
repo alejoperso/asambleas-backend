@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
@@ -30,6 +31,27 @@ const activeSessions = new Map();
 const socketUserMap = new Map();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// HELPER PARA OBTENER EL TIMESTAMP UNIX REAL DIRECTAMENTE DEL SERVIDOR DE ZOOM
+function getZoomServerUnixTime() {
+  return new Promise((resolve) => {
+    const req = https.request('https://zoom.us', { method: 'HEAD', timeout: 3000 }, (res) => {
+      if (res.headers && res.headers.date) {
+        const parsedTime = Math.floor(new Date(res.headers.date).getTime() / 1000);
+        if (!isNaN(parsedTime) && parsedTime > 0) {
+          return resolve(parsedTime);
+        }
+      }
+      resolve(Math.floor(Date.now() / 1000));
+    });
+    req.on('error', () => resolve(Math.floor(Date.now() / 1000)));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(Math.floor(Date.now() / 1000));
+    });
+    req.end();
+  });
+}
 
 // HELPER PARA GENERAR TOKENS SEGUROS DE ACCIÓN EN PODERES
 function generatePowerActionToken(powerId, action) {
@@ -992,7 +1014,6 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
-// ACTUALIZACIÓN DIRECTA DE USUARIO DEL PADRÓN POR ID NUMÉRICO (EVITA DUPLICADOS AL CAMBIAR IDENTIFICADOR)
 app.put('/api/superadmin/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1375,7 +1396,6 @@ app.delete('/api/questions/:id', async (req, res) => {
   }
 });
 
-// OBTENCIÓN DE PODERES CALCULANDO EL COEFICIENTE EFECTIVO TOTAL ACUMULADO DEL APODERADO
 app.get('/api/powers/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1401,7 +1421,6 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
   }
 });
 
-// ACCIÓN RÁPIDA DE APROBACIÓN / RECHAZO DESDE EL CORREO DEL REPRESENTANTE LEGAL
 app.get('/api/powers/:id/quick-action', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1544,7 +1563,6 @@ app.post('/api/powers/manual', async (req, res) => {
   }
 });
 
-// CARGA DE PODERES POR PARTE DE USUARIOS CON BOTONES DE ACCIÓN DIRECTA AL CORREO DEL REPRESENTANTE
 app.post('/api/powers', async (req, res) => {
   try {
     const { assemblyId, otorganteUnico, apoderadoUnico, documentoUrl } = req.body;
@@ -1662,7 +1680,6 @@ app.post('/api/powers', async (req, res) => {
   }
 });
 
-// OBTENCIÓN DE USUARIOS CON SU COEFICIENTE EFECTIVO TOTAL
 app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1791,8 +1808,8 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERACIÓN DE FIRMA JWT OFICIAL PARA ZOOM MEETING SDK
-app.post('/api/zoom/signature', (req, res) => {
+// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM SINCRONIZADO CON RELOJ DE ZOOM.US
+app.post('/api/zoom/signature', async (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
     const sdkKey = (process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w').trim();
@@ -1801,18 +1818,18 @@ app.post('/api/zoom/signature', (req, res) => {
     const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
     if (!cleanMn || isNaN(cleanMn)) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
 
-    const roleNum = parseInt(role, 10) === 1 ? 1 : 0;
-    const iat = Math.floor(Date.now() / 1000) - 30;
+    const zoomNow = await getZoomServerUnixTime();
+    const iat = zoomNow - 30;
     const exp = iat + 60 * 60 * 2;
 
     const oHeader = { alg: 'HS256', typ: 'JWT' };
     const oPayload = {
-      sdkKey: sdkKey,
+      sdkKey,
       appKey: sdkKey,
       mn: cleanMn,
-      role: roleNum,
-      iat: iat,
-      exp: exp,
+      role: parseInt(role || 0, 10),
+      iat,
+      exp,
       tokenExp: exp
     };
 
