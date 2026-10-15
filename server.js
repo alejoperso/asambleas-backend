@@ -1791,25 +1791,25 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERACIÓN DE FIRMA JWT OFICIAL PARA ZOOM MEETING SDK CON PROTECCIÓN CONTRA DESFASE DE FECHA
+// GENERACIÓN DE FIRMA JWT OFICIAL PARA ZOOM MEETING SDK
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
     const sdkKey = (process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w').trim();
     const sdkSecret = (process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6').trim();
 
-    const cleanMnStr = (meetingNumber || '').toString().replace(/\D/g, '');
-    if (!cleanMnStr) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
+    const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
+    if (!cleanMn || isNaN(cleanMn)) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
 
     const roleNum = parseInt(role, 10) === 1 ? 1 : 0;
-    const iat = Math.floor(Date.now() / 1000) - 60;
-    const exp = iat + 60 * 60 * 4;
+    const iat = Math.floor(Date.now() / 1000) - 30;
+    const exp = iat + 60 * 60 * 2;
 
     const oHeader = { alg: 'HS256', typ: 'JWT' };
     const oPayload = {
       sdkKey: sdkKey,
       appKey: sdkKey,
-      mn: cleanMnStr,
+      mn: cleanMn,
       role: roleNum,
       iat: iat,
       exp: exp,
