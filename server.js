@@ -285,53 +285,68 @@ async function getUserPowerDetails(userId, assemblyId) {
 }
 
 async function getUserEffectiveCoefficient(userId, assemblyId) {
-  if (!userId || userId === 0) return 0;
+  if (!userId || userId <= 0) return 0;
   const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
   if (isRepresented) return 0;
 
   const [u] = await db.query(`SELECT coeficiente, rol FROM usuarios WHERE id = ?`, [userId]);
   if (u.length === 0) return 0;
-  if (u[0].rol === 'soporte') return 0;
+  const rolLower = (u[0].rol || '').toLowerCase();
+  if (['soporte', 'superadmin', 'moderador', 'administrador', 'representante_legal'].includes(rolLower) && (parseFloat(u[0].coeficiente) || 0) === 0) {
+    return 0;
+  }
 
   const propio = parseFloat(u[0].coeficiente) || 0;
   const { coefPoderes } = await getUserPowerDetails(userId, assemblyId);
   return propio + coefPoderes;
 }
 
+// HELPER PARA OBTENER EL ESTADO ACTUAL DE QUÓRUM Y CONECTADOS DE UNA ASAMBLEA
+async function computeQuorumAndConnected(assemblyId) {
+  const targetAssembly = parseInt(assemblyId) || 1;
+  const activeList = [];
+  const activeUserIds = new Set();
+
+  for (const [key, session] of activeSessions.entries()) {
+    if (parseInt(session.assemblyId) === targetAssembly) {
+      if (session.userId > 0) {
+        activeUserIds.add(session.userId);
+      }
+
+      const coefEfectivo = session.userId > 0
+        ? await getUserEffectiveCoefficient(session.userId, targetAssembly)
+        : 0;
+
+      activeList.push({
+        userId: session.userId,
+        identificadorUnico: session.identificador_unico || session.identificadorUnico,
+        nombreCompleto: session.nombreCompleto,
+        unidad: session.unidad,
+        rol: session.rol,
+        coeficiente: coefEfectivo
+      });
+    }
+  }
+
+  let totalQuorum = 0;
+  if (activeUserIds.size > 0) {
+    for (let uId of activeUserIds) {
+      totalQuorum += await getUserEffectiveCoefficient(uId, targetAssembly);
+    }
+  }
+
+  const quorumPercentage = totalQuorum.toFixed(4);
+  return { quorumPercentage, total: activeList.length, usuarios: activeList };
+}
+
 // CÁLCULO Y TRANSMISIÓN EXACTA DEL QUÓRUM Y DE LOS COEFICIENTES EN VIVO
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
-    const activeList = [];
-    const activeUserIds = new Set();
-    
-    for (const [key, session] of activeSessions.entries()) {
-      if (session.assemblyId === parseInt(assemblyId)) {
-        activeUserIds.add(session.userId);
+    const targetAssembly = parseInt(assemblyId) || 1;
+    const { quorumPercentage, total, usuarios } = await computeQuorumAndConnected(targetAssembly);
 
-        const coefEfectivo = await getUserEffectiveCoefficient(session.userId, assemblyId);
-
-        activeList.push({
-          userId: session.userId,
-          identificadorUnico: session.identificador_unico || session.identificadorUnico,
-          nombreCompleto: session.nombreCompleto,
-          unidad: session.unidad,
-          rol: session.rol,
-          coeficiente: coefEfectivo
-        });
-      }
-    }
-
-    let totalQuorum = 0;
-    if (activeUserIds.size > 0) {
-      for (let uId of activeUserIds) {
-        totalQuorum += await getUserEffectiveCoefficient(uId, assemblyId);
-      }
-    }
-
-    const quorumPercentage = totalQuorum.toFixed(4);
-    
-    io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
-    io.to(`assembly_${assemblyId}`).emit('users:connected_update', { total: activeList.length, usuarios: activeList });
+    io.to(`assembly_${targetAssembly}`).emit('quorum:update', { quorumPercentage });
+    io.to(`assembly_${targetAssembly}`).emit('users:connected_update', { total, usuarios });
   } catch (err) {
     console.error('Error calculando quórum:', err);
   }
@@ -341,7 +356,7 @@ async function getVotingStats(assemblyId, preguntaId) {
   try {
     const rawActiveUserIds = new Set();
     for (const [key, session] of activeSessions.entries()) {
-      if (session.assemblyId === parseInt(assemblyId)) {
+      if (parseInt(session.assemblyId) === parseInt(assemblyId) && session.userId > 0) {
         rawActiveUserIds.add(session.userId);
       }
     }
@@ -404,10 +419,21 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
+// REST API: CONSULTA DIRECTA DE QUÓRUM Y CONECTADOS EN VIVO
+app.get('/api/quorum/:assemblyId', async (req, res) => {
+  try {
+    const { assemblyId } = req.params;
+    const data = await computeQuorumAndConnected(assemblyId);
+    res.json({ ok: true, ...data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // REST API: LOGIN DE ADMINISTRACIÓN Y SUPERADMIN
 app.post('/api/auth/admin-login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, assemblyId } = req.body;
     if (!email || !password) {
       return res.status(400).json({ ok: false, error: 'Correo y contraseña requeridos.' });
     }
@@ -433,7 +459,8 @@ app.post('/api/auth/admin-login', async (req, res) => {
     const [rows] = await db.query(
       `SELECT id, assembly_id, identificador_unico, nombre_completo, email, password, rol 
        FROM usuarios 
-       WHERE LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')`,
+       WHERE LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')
+       ORDER BY id DESC`,
       [cleanEmail]
     );
 
@@ -441,26 +468,53 @@ app.post('/api/auth/admin-login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Credenciales inválidas o sin permisos de gestión.' });
     }
 
-    const adminUser = rows[0];
-    if (!adminUser.password || adminUser.password.trim() === '') {
+    // Priorizar el registro que coincida con la asamblea solicitada en la URL (si existe)
+    let matchedUser = null;
+    if (assemblyId) {
+      matchedUser = rows.find(r => parseInt(r.assembly_id) === parseInt(assemblyId) && r.password && r.password.trim() !== '');
+    }
+    if (!matchedUser) {
+      matchedUser = rows.find(r => r.password && r.password.trim() !== '') || rows[0];
+    }
+
+    if (!matchedUser.password || matchedUser.password.trim() === '') {
       return res.status(401).json({ ok: false, error: 'El usuario no tiene una contraseña configurada.' });
     }
 
-    const isMatch = await bcrypt.compare(cleanPass, adminUser.password);
+    let isMatch = await bcrypt.compare(cleanPass, matchedUser.password);
+    if (!isMatch) {
+      // Verificar si coincide con la clave en algún otro registro del mismo correo de control
+      for (const candidate of rows) {
+        if (candidate.password && await bcrypt.compare(cleanPass, candidate.password)) {
+          matchedUser = candidate;
+          isMatch = true;
+          break;
+        }
+      }
+    }
+
     if (!isMatch) {
       return res.status(401).json({ ok: false, error: 'Contraseña incorrecta.' });
     }
 
-    const token = Buffer.from(`${adminUser.rol}_${adminUser.id}_${Date.now()}`).toString('base64');
+    // Si en la URL venía una asamblea específica y tiene registro en ella, usar ese assembly_id
+    if (assemblyId) {
+      const sameAssemblyRecord = rows.find(r => parseInt(r.assembly_id) === parseInt(assemblyId));
+      if (sameAssemblyRecord) {
+        matchedUser = sameAssemblyRecord;
+      }
+    }
+
+    const token = Buffer.from(`${matchedUser.rol}_${matchedUser.id}_${Date.now()}`).toString('base64');
     return res.json({
       ok: true,
       user: {
-        id: adminUser.id,
-        nombre_completo: adminUser.nombre_completo,
-        email: adminUser.email,
-        rol: adminUser.rol,
-        assembly_id: adminUser.assembly_id,
-        identificador_unico: adminUser.identificador_unico
+        id: matchedUser.id,
+        nombre_completo: matchedUser.nombre_completo,
+        email: matchedUser.email,
+        rol: matchedUser.rol,
+        assembly_id: matchedUser.assembly_id,
+        identificador_unico: matchedUser.identificador_unico
       },
       token
     });
@@ -508,6 +562,15 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
     if (password && password.trim() !== '') {
       const salt = await bcrypt.genSalt(10);
       hashedPassword = await bcrypt.hash(password.trim(), salt);
+    } else {
+      // Si el usuario de control ya existe en otra asamblea con contraseña, heredar su hash para que pueda iniciar sesión sin problema
+      const [existing] = await db.query(
+        `SELECT password FROM usuarios WHERE LOWER(email) = ? AND password IS NOT NULL AND password != '' ORDER BY id DESC LIMIT 1`,
+        [cleanEmail]
+      );
+      if (existing.length > 0) {
+        hashedPassword = existing[0].password;
+      }
     }
 
     if (hashedPassword) {
@@ -570,7 +633,11 @@ app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(plainPassword, salt);
 
-    await db.query(`UPDATE usuarios SET password = ? WHERE id = ?`, [hashedPassword, user.id]);
+    // Actualizar la contraseña en todos los registros de control con ese mismo correo para mantener consistencia multi-asamblea
+    await db.query(
+      `UPDATE usuarios SET password = ? WHERE id = ? OR (LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal'))`,
+      [hashedPassword, user.id, user.email.trim().toLowerCase()]
+    );
 
     const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
     const adminUrl = `${clientUrl}/admin.html?asamblea=${user.assembly_id || 1}`;
@@ -1580,7 +1647,7 @@ app.post('/api/powers', async (req, res) => {
               </div>
 
               <p style="font-size: 12px; color: #cbd5e1; line-height: 1.6; text-align: center;">
-                El documento adjunto se encuentra disponible en este correo. Puede hacer clic en cualquiera de los botones superiores para autorizar o rechazareste poder de manera inmediata.
+                El documento adjunto se encuentra disponible en este correo. Puede hacer clic en cualquiera de los botones superiores para autorizar o rechazar este poder de manera inmediata.
               </p>
 
               <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
@@ -1696,7 +1763,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
 
     const activeUserIds = new Set();
     for (const [key, session] of activeSessions.entries()) {
-      if (session.assemblyId === parseInt(id)) {
+      if (parseInt(session.assemblyId) === parseInt(id) && session.userId > 0) {
         activeUserIds.add(session.userId);
       }
     }
@@ -1788,7 +1855,7 @@ app.get('/', (req, res) => res.json({ status: 'online', version: '3.1.0-master' 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
 
-  socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password }) => {
+  socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password, isConsoleAdmin, rolConsola, nombreConsola }) => {
     try {
       const targetAssembly = parseInt(assemblyId) || 1;
       const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
@@ -1802,15 +1869,43 @@ io.on('connection', (socket) => {
         [targetAssembly, targetEmail || targetId.toLowerCase(), targetId]
       );
 
-      // Bypass automático para Superadmin
-      if (rows.length === 0 && (targetId === 'SUPERADMIN' || targetId.startsWith('ADMIN-') || targetEmail === SUPERADMIN_EMAIL.toLowerCase())) {
+      // Si no está en la asamblea destino pero es un usuario de control registrado en el sistema (Moderador, Rep. Legal, Admin, Soporte), permitir unión a la sala
+      if (rows.length === 0 && (targetEmail || targetId)) {
+        const [controlRows] = await db.query(
+          `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol 
+           FROM usuarios 
+           WHERE (LOWER(email) = ? OR UPPER(identificador_unico) = ?) 
+             AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')
+           ORDER BY id DESC LIMIT 1`,
+          [targetEmail || targetId.toLowerCase(), targetId]
+        );
+        if (controlRows.length > 0) {
+          rows = [{
+            ...controlRows[0],
+            coeficiente: 0.00000
+          }];
+        }
+      }
+
+      // Bypass automático para Superadmin o conexión directa desde consola admin.html autenticada
+      if (
+        rows.length === 0 &&
+        (
+          targetId === 'SUPERADMIN' ||
+          targetId.startsWith('ADMIN-') ||
+          targetId.startsWith('MODERADOR-') ||
+          targetId.startsWith('REPRESENTANTE_LEGAL-') ||
+          targetEmail === SUPERADMIN_EMAIL.toLowerCase() ||
+          isConsoleAdmin
+        )
+      ) {
         rows = [{
           id: 0,
-          identificador_unico: 'SUPERADMIN',
-          nombre_completo: 'Super Administrador',
+          identificador_unico: targetId || 'SUPERADMIN',
+          nombre_completo: nombreConsola || 'Consola de Control',
           unidad: 'CONTROL',
           coeficiente: 0.00000,
-          rol: 'superadmin'
+          rol: rolConsola || 'superadmin'
         }];
       }
 
@@ -1827,7 +1922,8 @@ io.on('connection', (socket) => {
 
       const user = rows[0];
 
-      if (user.password && user.password.trim() !== '' && user.rol === 'asistente') {
+      // Solo exigir contraseña en socket a los copropietarios/asistentes (la consola admin ya validó su login por HTTP)
+      if (!isConsoleAdmin && user.password && user.password.trim() !== '' && user.rol === 'asistente') {
         if (!targetPassword) {
           return socket.emit('auth:error', 'Ingresa tu contraseña.');
         }
@@ -1838,19 +1934,34 @@ io.on('connection', (socket) => {
       }
 
       const userId = user.id;
-      const sessionKey = `${targetAssembly}_${userId}`;
+      const isControlRole = ['superadmin', 'administrador', 'moderador', 'representante_legal', 'soporte'].includes((user.rol || '').toLowerCase());
+      // Para la consola administrativa (id 0 o rol de control en admin.html) usar una clave de sesión que no expulse al copropietario ni colisione entre pestañas de control
+      const sessionKey = (isConsoleAdmin || userId === 0)
+        ? `${targetAssembly}_CONSOLE_${userId}_${socket.id}`
+        : `${targetAssembly}_${userId}`;
 
-      if (activeSessions.has(sessionKey)) {
+      if (!isConsoleAdmin && userId > 0 && !isControlRole && activeSessions.has(sessionKey)) {
         const existingSession = activeSessions.get(sessionKey);
         if (existingSession.socketId !== socket.id) {
           io.to(existingSession.socketId).emit('auth:kicked', { message: 'Tu sesión ha sido iniciada en otro dispositivo.' });
         }
       }
 
-      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: user.identificador_unico, nombreCompleto: user.nombre_completo, unidad: user.unidad, rol: user.rol });
-      socketUserMap.set(socket.id, sessionKey);
+      // No agregar la consola oculta del SuperAdmin (userId === 0) ni conexiones de consola duplicadas al listado de asistentes si es SuperAdmin, pero sí registrar los roles o mantener limpio el conteo
+      if (!isConsoleAdmin) {
+        activeSessions.set(sessionKey, {
+          userId,
+          assemblyId: targetAssembly,
+          socketId: socket.id,
+          identificadorUnico: user.identificador_unico,
+          nombreCompleto: user.nombre_completo,
+          unidad: user.unidad,
+          rol: user.rol
+        });
+        socketUserMap.set(socket.id, sessionKey);
+        socket.sessionKey = sessionKey;
+      }
 
-      socket.sessionKey = sessionKey;
       socket.assemblyId = targetAssembly;
       socket.userId = userId;
 
@@ -1860,7 +1971,7 @@ io.on('connection', (socket) => {
       const { coefPoderes, representadosAprobados, representadosPendientes, isRepresented } = await getUserPowerDetails(userId, targetAssembly);
       user.coeficientePropio = parseFloat(user.coeficiente) || 0;
       user.coeficientePoderes = coefPoderes;
-      user.coeficienteEfectivo = (isRepresented || user.rol === 'soporte') ? 0 : (user.coeficientePropio + coefPoderes);
+      user.coeficienteEfectivo = (isRepresented || user.rol === 'soporte' || userId === 0) ? 0 : (user.coeficientePropio + coefPoderes);
       user.isRepresented = isRepresented;
       user.poderesAprobados = representadosAprobados;
       user.poderesPendientes = representadosPendientes;
