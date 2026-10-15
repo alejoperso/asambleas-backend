@@ -27,40 +27,6 @@ const socketUserMap = new Map();
 // RETARDO PARA CONTROL DE FRECUENCIA (RESEND LIMIT: 2 CORREOS / SEGUNDO EN FREE TIER)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA
-async function initDbSchema() {
-  try {
-    // 1. Crear tabla de documentos si no existe
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS documentos (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        assembly_id INT NOT NULL,
-        titulo VARCHAR(255) NOT NULL,
-        archivo_url LONGTEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // 2. Modificaciones de columnas auxiliares para asambleas
-    const alterQueries = [
-      `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
-      `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
-      `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
-    ];
-    for (const q of alterQueries) {
-      try {
-        await db.query(q);
-      } catch (e) {
-        // Ignorar error si la columna ya existe
-      }
-    }
-    console.log('✅ Verificación y migración de esquema completada.');
-  } catch (err) {
-    console.warn('Advertencia en verificación de esquema:', err.message);
-  }
-}
-initDbSchema();
-
 // GENERADOR DE CONTRASEÑA ALFANUMÉRICA
 function generateAlphanumericPassword(length = 8) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
@@ -75,7 +41,7 @@ function generateAlphanumericPassword(length = 8) {
 const memoryDocuments = [];
 const memoryChat = [];
 const memoryAssemblies = [
-  { id: 1, nombre_copropiedad: 'Conjunto Residencial Parque Real', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', admin_user: 'ADMIN01', estado: 'programada' }
+  { id: 1, nombre_copropiedad: 'Conjunto Residencial Parque Real', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', admin_user: 'ADMIN01' }
 ];
 
 function toBase64Url(input) {
@@ -210,150 +176,16 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: ASAMBLEAS ACTIVAS
+// REST API: ASAMBLEAS ACTIVAS PARA LANDING PAGE
 app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
   try {
     try {
-      const [rows] = await db.query(`SELECT * FROM asambleas ORDER BY id DESC`);
+      const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, estado FROM asambleas ORDER BY id DESC`);
       return res.json({ ok: true, asambleas: rows, assemblies: rows });
     } catch (e) {
-      console.error('Error al consultar asambleas en BD:', e);
       return res.json({ ok: true, asambleas: memoryAssemblies, assemblies: memoryAssemblies });
     }
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// REST API: INICIAR Y CERRAR ASAMBLEA
-app.post('/api/assemblies/:id/start', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const now = new Date();
-    try {
-      await db.query(`UPDATE asambleas SET estado = 'en_curso', hora_inicio = NOW() WHERE id = ?`, [id]);
-    } catch (e) {
-      await db.query(`UPDATE asambleas SET estado = 'en_curso' WHERE id = ?`, [id]);
-    }
-
-    const roomName = `assembly_${id}`;
-    io.to(roomName).emit('assembly:started', {
-      message: '¡La Asamblea ha iniciado oficialmente!',
-      horaInicio: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    });
-    io.emit('assemblies:updated');
-
-    res.json({ ok: true, message: 'Asamblea iniciada oficialmente.', horaInicio: now });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.post('/api/assemblies/:id/close', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const now = new Date();
-    try {
-      await db.query(`UPDATE asambleas SET estado = 'finalizada', hora_cierre = NOW() WHERE id = ?`, [id]);
-    } catch (e) {
-      await db.query(`UPDATE asambleas SET estado = 'finalizada' WHERE id = ?`, [id]);
-    }
-
-    const roomName = `assembly_${id}`;
-    io.to(roomName).emit('assembly:closed', {
-      message: 'La Asamblea ha sido cerrada de manera oficial.',
-      horaCierre: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    });
-    io.emit('assemblies:updated');
-
-    res.json({ ok: true, message: 'Asamblea finalizada y cerrada oficialmente.', horaCierre: now });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// REST API SUPERADMIN: ELIMINACIÓN DEFINITIVA DE ASAMBLEA EN CASCADA (TOLERANTE A TABLAS FALTANTES)
-app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const targetAssembly = parseInt(id);
-
-    // Detener cronómetros activos
-    if (activeQuestions.has(targetAssembly)) {
-      if (timerIntervals.has(targetAssembly)) {
-        clearInterval(timerIntervals.get(targetAssembly));
-        timerIntervals.delete(targetAssembly);
-      }
-      activeQuestions.delete(targetAssembly);
-    }
-
-    // Lista de pasos de borrado tolerantes a fallos
-    const cleanupSteps = [
-      { name: 'votos', query: `DELETE FROM votos WHERE assembly_id = ?`, params: [targetAssembly] },
-      { name: 'opciones_pregunta', query: `DELETE FROM opciones_pregunta WHERE pregunta_id IN (SELECT id FROM preguntas WHERE assembly_id = ?)`, params: [targetAssembly] },
-      { name: 'preguntas', query: `DELETE FROM preguntas WHERE assembly_id = ?`, params: [targetAssembly] },
-      { name: 'poderes', query: `DELETE FROM poderes WHERE assembly_id = ?`, params: [targetAssembly] },
-      { name: 'documentos', query: `DELETE FROM documentos WHERE assembly_id = ?`, params: [targetAssembly] },
-      { name: 'usuarios', query: `DELETE FROM usuarios WHERE assembly_id = ?`, params: [targetAssembly] },
-      { name: 'asambleas', query: `DELETE FROM asambleas WHERE id = ?`, params: [targetAssembly] }
-    ];
-
-    for (const step of cleanupSteps) {
-      try {
-        await db.query(step.query, step.params);
-      } catch (errStep) {
-        console.warn(`Aviso durante limpieza de [${step.name}]:`, errStep.message);
-      }
-    }
-
-    const roomName = `assembly_${targetAssembly}`;
-    io.to(roomName).emit('assembly:deleted', { message: 'Esta asamblea ha sido eliminada por la administración general.' });
-    io.emit('assemblies:updated');
-
-    res.json({ ok: true, message: `Asamblea #${targetAssembly} y todos sus datos relacionados fueron eliminados permanentemente.` });
-  } catch (err) {
-    console.error('Error al eliminar asamblea:', err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// REST API SUPERADMIN: DEPURAR ASAMBLEA (RESET VOTOS Y PREGUNTAS)
-app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const targetAssembly = parseInt(id);
-
-    // 1. Eliminar todos los votos de la asamblea
-    await db.query(`DELETE FROM votos WHERE assembly_id = ?`, [targetAssembly]);
-
-    // 2. Restaurar estado de preguntas a 'borrador'
-    await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE assembly_id = ?`, [targetAssembly]);
-
-    // 3. Limpiar horas de inicio/cierre y restablecer estado a 'programada'
-    try {
-      await db.query(`UPDATE asambleas SET estado = 'programada', hora_inicio = NULL, hora_cierre = NULL WHERE id = ?`, [targetAssembly]);
-    } catch (e) {
-      await db.query(`UPDATE asambleas SET estado = 'programada' WHERE id = ?`, [targetAssembly]);
-    }
-
-    // 4. Detener cronómetros o preguntas activas
-    if (activeQuestions.has(targetAssembly)) {
-      if (timerIntervals.has(targetAssembly)) {
-        clearInterval(timerIntervals.get(targetAssembly));
-        timerIntervals.delete(targetAssembly);
-      }
-      activeQuestions.delete(targetAssembly);
-    }
-
-    // 5. Emitir eventos de actualización a los clientes conectados
-    const roomName = `assembly_${targetAssembly}`;
-    io.to(roomName).emit('assembly:reset', { message: 'La asamblea ha sido depurada y reiniciada.' });
-    io.to(roomName).emit('questions:updated');
-    io.emit('assemblies:updated');
-
-    res.json({ ok: true, message: 'Asamblea depurada exitosamente. Se borraron los votos y las preguntas volvieron a estado inicial.' });
-  } catch (err) {
-    console.error('Error al depurar asamblea:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -380,46 +212,6 @@ app.post('/api/support-users', async (req, res) => {
   }
 });
 
-// REST API ASESOR TÉCNICO: OBTENER SESIONES CONECTADAS EN TIEMPO REAL
-app.get('/api/support/active-sessions/:assemblyId', async (req, res) => {
-  try {
-    const { assemblyId } = req.params;
-    const targetAssembly = parseInt(assemblyId);
-
-    const activeList = [];
-    for (const [sessionKey, session] of activeSessions.entries()) {
-      if (session.assemblyId === targetAssembly) {
-        activeList.push(session);
-      }
-    }
-
-    res.json({ ok: true, totalConectados: activeList.length, sesiones: activeList });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// REST API ASESOR TÉCNICO: DESCONECTAR / LIBERAR SESIÓN TRABADA
-app.post('/api/support/kick-user', async (req, res) => {
-  try {
-    const { assemblyId, userId } = req.body;
-    const sessionKey = `${assemblyId}_${userId}`;
-
-    if (activeSessions.has(sessionKey)) {
-      const sessionData = activeSessions.get(sessionKey);
-      io.to(sessionData.socketId).emit('auth:kicked', { message: 'El Asesor Técnico ha reiniciado tu sesión para corregir un inconveniente de conexión.' });
-      activeSessions.delete(sessionKey);
-      socketUserMap.delete(sessionData.socketId);
-      await updateAndBroadcastQuorum(assemblyId);
-      return res.json({ ok: true, message: 'Sesión liberada correctamente.' });
-    }
-
-    res.json({ ok: true, message: 'El usuario no tenía sesión activa registrada.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
 // REST API: SUPER ADMINISTRADOR
 app.get('/api/superadmin/assemblies', async (req, res) => {
   try {
@@ -441,8 +233,8 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
 
     const [result] = await db.query(
-      `INSERT INTO asambleas (nombre_copropiedad, logo_url, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
-       VALUES (?, ?, 'programada', ?, ?, ?, ?)`,
+      `INSERT INTO asambleas (nombre_copropiedad, logo_url, fecha_evento, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
+       VALUES (?, ?, NOW(), 'programada', ?, ?, ?, ?)`,
       [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode, parsed.passcode]
     );
     const assemblyId = result.insertId;
@@ -466,7 +258,7 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     io.emit('assemblies:updated');
     return res.json({ ok: true, assemblyId, message: 'Asamblea creada con éxito.' });
   } catch (err) {
-    console.error('Error al crear asamblea:', err);
+    console.error('Error crítico al crear asamblea en MySQL:', err);
     return res.status(500).json({ ok: false, error: `Error SQL: ${err.message}` });
   }
 });
@@ -529,7 +321,7 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
-// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK
+// REST API: GENERAR Y ENVIAR CREDENCIALES VÍA RESEND SDK CON PACING MASIVO
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -599,16 +391,17 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
           sentCount++;
         }
       } catch (sendErr) {
-        console.error(`Error enviando correo a ${user.email}:`, sendErr);
+        console.error(`Error de excepción enviando correo a ${user.email}:`, sendErr);
         errorCount++;
       }
 
+      // RETARDO DE 600 MS PARA CUMPLIR CON EL LÍMITE DE 2 CORREOS/SEG DE RESEND
       await sleep(600);
     }
 
     return res.json({
       ok: true,
-      message: `Proceso completado. Enviados: ${sentCount}, Fallidos: ${errorCount}.`,
+      message: `Proceso completado con Resend. Enviados: ${sentCount}, Fallidos: ${errorCount}.`,
       sentCount,
       errorCount
     });
@@ -619,7 +412,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
   }
 });
 
-// REST API: GENERAR Y ENVIAR CREDENCIAL A UN USUARIO
+// REST API: GENERAR, ACTUALIZAR Y ENVIAR CREDENCIAL A UN SOLO USUARIO INDIVIDUAL
 app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
@@ -707,16 +500,16 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
 app.get('/api/assemblies/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.query(`SELECT * FROM asambleas WHERE id = ?`, [id]);
+    const [rows] = await db.query(`SELECT id, nombre_copropiedad, logo_url, zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
     if (rows.length === 0) {
       return res.json({
         ok: true,
-        assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', estado: 'programada' }
+        assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad' }
       });
     }
     res.json({ ok: true, assembly: rows[0] });
   } catch (err) {
-    res.json({ ok: true, assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad', estado: 'programada' } });
+    res.json({ ok: true, assembly: { id: 1, nombre_copropiedad: 'Asamblea General', logo_url: 'https://via.placeholder.com/150x40?text=Copropiedad' } });
   }
 });
 
@@ -898,23 +691,6 @@ app.put('/api/powers/:id/status', async (req, res) => {
   }
 });
 
-app.delete('/api/powers/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
-    if (p.length === 0) return res.status(404).json({ ok: false, error: 'Poder no encontrado' });
-
-    const targetAssembly = p[0].assembly_id;
-    await db.query(`DELETE FROM poderes WHERE id = ?`, [id]);
-
-    await updateAndBroadcastQuorum(targetAssembly);
-    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
-    res.json({ ok: true, message: 'Poder eliminado correctamente.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
 app.post('/api/powers/manual', async (req, res) => {
   try {
     const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
@@ -1013,89 +789,13 @@ app.get('/api/reports/assembly/:id/excel', async (req, res) => {
     let csvContent = "\uFEFFPregunta;ID Votante;Nombre;Unidad;Opción Votada;Coeficiente Aplicado (%);Fecha y Hora\n";
     votos.forEach(v => {
       const coefPct = parseFloat(v.Coeficiente_Efectivo).toFixed(4);
-      const fecha = new Date(v.Fecha_Hora_Voto).toLocaleString('es-CO', { timeZone: 'America/Bogota' });
+      const fecha = new Date(v.Fecha_Hora_Voto).toLocaleString('es-CO');
       csvContent += `"${v.Pregunta}";"${v.ID_Votante}";"${v.Nombre}";"${v.Unidad}";"${v.Opcion_Votada}";"${coefPct}%";"${fecha}"\n`;
     });
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename=Reporte_Votacion_Asamblea_${id}.csv`);
     res.status(200).send(csvContent);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// REST API: DATOS CONSOLIDADOS PARA INFORMES PDF CON FALLBACKS DE FECHA
-app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const [asambleas] = await db.query(`SELECT * FROM asambleas WHERE id = ?`, [id]);
-    if (asambleas.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
-
-    const [usuarios] = await db.query(
-      `SELECT id, identificador_unico, nombre_completo, unidad, coeficiente, email, rol 
-       FROM usuarios 
-       WHERE assembly_id = ? AND rol = 'asistente' 
-       ORDER BY unidad ASC`,
-      [id]
-    );
-
-    const [preguntas] = await db.query(
-      `SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC, id ASC`,
-      [id]
-    );
-
-    for (let p of preguntas) {
-      const [opciones] = await db.query(
-        `SELECT * FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`,
-        [p.id]
-      );
-      p.opciones = opciones;
-    }
-
-    const [votos] = await db.query(
-      `SELECT v.id, v.pregunta_id, v.usuario_id, v.opcion_id, o.texto_opcion, v.coeficiente_aplicado, v.created_at
-       FROM votos v
-       JOIN opciones_pregunta o ON v.opcion_id = o.id
-       WHERE v.assembly_id = ?`,
-      [id]
-    );
-
-    // Conectados en tiempo real
-    const activeUserIds = new Set();
-    for (const [key, session] of activeSessions.entries()) {
-      if (session.assemblyId === parseInt(id)) {
-        activeUserIds.add(session.userId);
-      }
-    }
-
-    const totalCargados = usuarios.length;
-    const totalConectados = activeUserIds.size;
-    const totalNoConectados = Math.max(0, totalCargados - totalConectados);
-
-    // Determinar primera fecha de voto registrada como fallback
-    let primerVotoFecha = null;
-    if (votos.length > 0) {
-      primerVotoFecha = votos[0].created_at;
-    }
-
-    const asambleaData = asambleas[0];
-    
-    // Priorización inteligente de fecha: fecha_evento -> hora_inicio -> primerVoto -> created_at -> hoy
-    asambleaData.fecha_evento_final = asambleaData.fecha_evento || asambleaData.hora_inicio || primerVotoFecha || asambleaData.created_at || new Date();
-
-    res.json({
-      ok: true,
-      asamblea: asambleaData,
-      usuarios,
-      preguntas,
-      votos,
-      asistencia: {
-        totalCargados,
-        totalConectados,
-        totalNoConectados
-      }
-    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1207,7 +907,7 @@ io.on('connection', (socket) => {
         }
       }
 
-      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: user.identificador_unico, nombreCompleto: user.nombre_completo, unidad: user.unidad, rol: user.rol });
+      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: user.identificador_unico });
       socketUserMap.set(socket.id, sessionKey);
 
       socket.sessionKey = sessionKey;
@@ -1246,7 +946,7 @@ io.on('connection', (socket) => {
       texto,
       emisor: emisor || 'Asistente',
       unidad: unidad || '---',
-      hora: new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit' })
+      hora: new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
     };
     memoryChat.push(msgData);
     if (memoryChat.length > 100) memoryChat.shift();
