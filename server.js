@@ -1791,7 +1791,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERACIÓN DE FIRMA JWT OFICIAL PARA ZOOM MEETING SDK
+// GENERACIÓN DE FIRMA JWT OFICIAL PARA ZOOM MEETING SDK CON PROTECCIÓN CONTRA DESFASE DE FECHA
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
@@ -1802,7 +1802,6 @@ app.post('/api/zoom/signature', (req, res) => {
     if (!cleanMnStr) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
 
     const roleNum = parseInt(role, 10) === 1 ? 1 : 0;
-    // Margen de 60s hacia atrás para evitar rechazo de firma por desfase de reloj NTP
     const iat = Math.floor(Date.now() / 1000) - 60;
     const exp = iat + 60 * 60 * 4;
 
