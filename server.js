@@ -468,7 +468,6 @@ app.post('/api/auth/admin-login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Credenciales inválidas o sin permisos de gestión.' });
     }
 
-    // Priorizar el registro que coincida con la asamblea solicitada en la URL (si existe)
     let matchedUser = null;
     if (assemblyId) {
       matchedUser = rows.find(r => parseInt(r.assembly_id) === parseInt(assemblyId) && r.password && r.password.trim() !== '');
@@ -483,7 +482,6 @@ app.post('/api/auth/admin-login', async (req, res) => {
 
     let isMatch = await bcrypt.compare(cleanPass, matchedUser.password);
     if (!isMatch) {
-      // Verificar si coincide con la clave en algún otro registro del mismo correo de control
       for (const candidate of rows) {
         if (candidate.password && await bcrypt.compare(cleanPass, candidate.password)) {
           matchedUser = candidate;
@@ -497,7 +495,6 @@ app.post('/api/auth/admin-login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Contraseña incorrecta.' });
     }
 
-    // Si en la URL venía una asamblea específica y tiene registro en ella, usar ese assembly_id
     if (assemblyId) {
       const sameAssemblyRecord = rows.find(r => parseInt(r.assembly_id) === parseInt(assemblyId));
       if (sameAssemblyRecord) {
@@ -563,7 +560,6 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
       const salt = await bcrypt.genSalt(10);
       hashedPassword = await bcrypt.hash(password.trim(), salt);
     } else {
-      // Si el usuario de control ya existe en otra asamblea con contraseña, heredar su hash para que pueda iniciar sesión sin problema
       const [existing] = await db.query(
         `SELECT password FROM usuarios WHERE LOWER(email) = ? AND password IS NOT NULL AND password != '' ORDER BY id DESC LIMIT 1`,
         [cleanEmail]
@@ -633,7 +629,6 @@ app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(plainPassword, salt);
 
-    // Actualizar la contraseña en todos los registros de control con ese mismo correo para mantener consistencia multi-asamblea
     await db.query(
       `UPDATE usuarios SET password = ? WHERE id = ? OR (LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal'))`,
       [hashedPassword, user.id, user.email.trim().toLowerCase()]
@@ -1580,7 +1575,6 @@ app.post('/api/powers', async (req, res) => {
     const powerId = resultPoder.insertId;
     io.to(`assembly_${targetAssembly}`).emit('powers:updated');
 
-    // NOTIFICACIÓN AUTOMÁTICA CON BOTONES DE APROBACIÓN/RECHAZO EN EL CORREO
     try {
       const [reps] = await db.query(
         `SELECT email, nombre_completo FROM usuarios 
@@ -1797,20 +1791,31 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
+// GENERACIÓN DE FIRMA JWT OFICIAL PARA ZOOM MEETING SDK
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
-    const sdkKey = process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w';
-    const sdkSecret = process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6';
+    const sdkKey = (process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w').trim();
+    const sdkSecret = (process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6').trim();
 
-    const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
-    if (!cleanMn || isNaN(cleanMn)) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
+    const cleanMnStr = (meetingNumber || '').toString().replace(/\D/g, '');
+    if (!cleanMnStr) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
 
-    const iat = Math.floor(Date.now() / 1000) - 30;
-    const exp = iat + 60 * 60 * 2;
+    const roleNum = parseInt(role, 10) === 1 ? 1 : 0;
+    // Margen de 60s hacia atrás para evitar rechazo de firma por desfase de reloj NTP
+    const iat = Math.floor(Date.now() / 1000) - 60;
+    const exp = iat + 60 * 60 * 4;
 
     const oHeader = { alg: 'HS256', typ: 'JWT' };
-    const oPayload = { sdkKey, appKey: sdkKey, mn: cleanMn, role: parseInt(role || 0, 10), iat, exp, tokenExp: exp };
+    const oPayload = {
+      sdkKey: sdkKey,
+      appKey: sdkKey,
+      mn: cleanMnStr,
+      role: roleNum,
+      iat: iat,
+      exp: exp,
+      tokenExp: exp
+    };
 
     const sHeader = toBase64Url(JSON.stringify(oHeader));
     const sPayload = toBase64Url(JSON.stringify(oPayload));
@@ -1869,7 +1874,6 @@ io.on('connection', (socket) => {
         [targetAssembly, targetEmail || targetId.toLowerCase(), targetId]
       );
 
-      // Si no está en la asamblea destino pero es un usuario de control registrado en el sistema (Moderador, Rep. Legal, Admin, Soporte), permitir unión a la sala
       if (rows.length === 0 && (targetEmail || targetId)) {
         const [controlRows] = await db.query(
           `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol 
@@ -1887,7 +1891,6 @@ io.on('connection', (socket) => {
         }
       }
 
-      // Bypass automático para Superadmin o conexión directa desde consola admin.html autenticada
       if (
         rows.length === 0 &&
         (
@@ -1922,7 +1925,6 @@ io.on('connection', (socket) => {
 
       const user = rows[0];
 
-      // Solo exigir contraseña en socket a los copropietarios/asistentes (la consola admin ya validó su login por HTTP)
       if (!isConsoleAdmin && user.password && user.password.trim() !== '' && user.rol === 'asistente') {
         if (!targetPassword) {
           return socket.emit('auth:error', 'Ingresa tu contraseña.');
@@ -1935,7 +1937,6 @@ io.on('connection', (socket) => {
 
       const userId = user.id;
       const isControlRole = ['superadmin', 'administrador', 'moderador', 'representante_legal', 'soporte'].includes((user.rol || '').toLowerCase());
-      // Para la consola administrativa (id 0 o rol de control en admin.html) usar una clave de sesión que no expulse al copropietario ni colisione entre pestañas de control
       const sessionKey = (isConsoleAdmin || userId === 0)
         ? `${targetAssembly}_CONSOLE_${userId}_${socket.id}`
         : `${targetAssembly}_${userId}`;
@@ -1947,7 +1948,6 @@ io.on('connection', (socket) => {
         }
       }
 
-      // No agregar la consola oculta del SuperAdmin (userId === 0) ni conexiones de consola duplicadas al listado de asistentes si es SuperAdmin, pero sí registrar los roles o mantener limpio el conteo
       if (!isConsoleAdmin) {
         activeSessions.set(sessionKey, {
           userId,
@@ -1992,7 +1992,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // REFRESCO EN CALIENTE DE COEFICIENTES Y PODERES DEL USUARIO SIN REINICIAR SOCKET NI ZOOM
   socket.on('auth:refresh_user', async () => {
     try {
       const { assemblyId, userId } = socket;
