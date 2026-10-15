@@ -180,6 +180,9 @@ async function initDbSchema() {
 
     const alterQueries = [
       `ALTER TABLE usuarios MODIFY COLUMN rol VARCHAR(50) NOT NULL DEFAULT 'asistente'`,
+      `ALTER TABLE asambleas MODIFY COLUMN logo_url LONGTEXT NULL`,
+      `ALTER TABLE asambleas MODIFY COLUMN estado VARCHAR(50) DEFAULT 'programada'`,
+      `ALTER TABLE asambleas MODIFY COLUMN zoom_embed_url LONGTEXT NULL`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
@@ -309,7 +312,7 @@ async function updateAndBroadcastQuorum(assemblyId) {
 
         activeList.push({
           userId: session.userId,
-          identificadorUnico: session.identificadorUnico,
+          identificadorUnico: session.identificador_unico || session.identificadorUnico,
           nombreCompleto: session.nombreCompleto,
           unidad: session.unidad,
           rol: session.rol,
@@ -927,6 +930,41 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
+// ACTUALIZACIÓN DIRECTA DE USUARIO DEL PADRÓN POR ID NUMÉRICO (EVITA DUPLICADOS AL CAMBIAR IDENTIFICADOR)
+app.put('/api/superadmin/users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { assemblyId, identificadorUnico, nombreCompleto, email, unidad, coeficiente } = req.body;
+
+    if (!identificadorUnico || identificadorUnico.toString().trim() === '') {
+      return res.status(400).json({ ok: false, error: 'El identificador único es obligatorio.' });
+    }
+
+    const cleanIdUnico = identificadorUnico.toString().trim().toUpperCase();
+    const cleanNombre = (nombreCompleto || cleanIdUnico).toString().trim();
+    const cleanEmail = (email || '').toString().trim().toLowerCase();
+    const cleanUnidad = (unidad || '---').toString().trim();
+    const cleanCoef = isNaN(parseFloat(coeficiente)) ? 0.00000 : parseFloat(coeficiente);
+
+    await db.query(
+      `UPDATE usuarios 
+       SET identificador_unico = ?, nombre_completo = ?, email = ?, unidad = ?, coeficiente = ? 
+       WHERE id = ?`,
+      [cleanIdUnico, cleanNombre, cleanEmail, cleanUnidad, cleanCoef, id]
+    );
+
+    if (assemblyId) {
+      await updateAndBroadcastQuorum(assemblyId);
+      io.to(`assembly_${assemblyId}`).emit('users:updated');
+    }
+
+    res.json({ ok: true, message: 'Usuario actualizado correctamente.' });
+  } catch (err) {
+    console.error('Error actualizando usuario del padrón:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -1119,8 +1157,17 @@ app.put('/api/assemblies/:id/info', async (req, res) => {
   try {
     const { id } = req.params;
     const { nombreCopropiedad, logoBase64 } = req.body;
-    await db.query(`UPDATE asambleas SET nombre_copropiedad = ?, logo_url = ? WHERE id = ?`, [nombreCopropiedad, logoBase64, id]);
-    io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl: logoBase64 });
+
+    if (logoBase64 && logoBase64.trim() !== '') {
+      await db.query(`UPDATE asambleas SET nombre_copropiedad = ?, logo_url = ? WHERE id = ?`, [nombreCopropiedad, logoBase64, id]);
+      io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl: logoBase64 });
+    } else {
+      await db.query(`UPDATE asambleas SET nombre_copropiedad = ? WHERE id = ?`, [nombreCopropiedad, id]);
+      const [rows] = await db.query(`SELECT logo_url FROM asambleas WHERE id = ?`, [id]);
+      const currentLogo = rows.length > 0 ? rows[0].logo_url : null;
+      io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl: currentLogo });
+    }
+
     res.json({ ok: true, message: 'Información de copropiedad actualizada.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1533,7 +1580,7 @@ app.post('/api/powers', async (req, res) => {
               </div>
 
               <p style="font-size: 12px; color: #cbd5e1; line-height: 1.6; text-align: center;">
-                El documento adjunto se encuentra disponible en este correo. Puede hacer clic en cualquiera de los botones superiores para autorizar o rechazar este poder de manera inmediata.
+                El documento adjunto se encuentra disponible en este correo. Puede hacer clic en cualquiera de los botones superiores para autorizar o rechazareste poder de manera inmediata.
               </p>
 
               <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
@@ -1824,8 +1871,9 @@ io.on('connection', (socket) => {
       if (activeQuestions.has(targetAssembly)) {
         const activeQ = activeQuestions.get(targetAssembly);
         const stats = await getVotingStats(targetAssembly, activeQ.id);
+        const resultados = await calculateWeightedResults(targetAssembly, activeQ.id);
         const [votoUsuario] = await db.query(`SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`, [activeQ.id, userId]);
-        socket.emit('voting:current_state', { ...activeQ, stats, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
+        socket.emit('voting:current_state', { ...activeQ, stats, resultados, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
       }
     } catch (error) {
       console.error('Error al autenticar socket:', error);
@@ -1833,10 +1881,38 @@ io.on('connection', (socket) => {
     }
   });
 
+  // REFRESCO EN CALIENTE DE COEFICIENTES Y PODERES DEL USUARIO SIN REINICIAR SOCKET NI ZOOM
+  socket.on('auth:refresh_user', async () => {
+    try {
+      const { assemblyId, userId } = socket;
+      if (!assemblyId || !userId) return;
+
+      const [rows] = await db.query(
+        `SELECT id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol FROM usuarios WHERE id = ?`,
+        [userId]
+      );
+      if (rows.length === 0) return;
+
+      const user = rows[0];
+      const { coefPoderes, representadosAprobados, representadosPendientes, isRepresented } = await getUserPowerDetails(userId, assemblyId);
+      user.coeficientePropio = parseFloat(user.coeficiente) || 0;
+      user.coeficientePoderes = coefPoderes;
+      user.coeficienteEfectivo = (isRepresented || user.rol === 'soporte') ? 0 : (user.coeficientePropio + coefPoderes);
+      user.isRepresented = isRepresented;
+      user.poderesAprobados = representadosAprobados;
+      user.poderesPendientes = representadosPendientes;
+
+      socket.emit('user:coef_updated', { user });
+    } catch (err) {
+      console.error('Error en auth:refresh_user:', err);
+    }
+  });
+
   socket.on('chat:message', ({ texto, emisor, unidad }) => {
     const targetAssembly = socket.assemblyId || 1;
     const msgData = {
       id: Date.now(),
+      assemblyId: targetAssembly,
       texto,
       emisor: emisor || 'Asistente',
       unidad: unidad || '---',
@@ -1858,7 +1934,8 @@ io.on('connection', (socket) => {
 
       const duracion = parseInt(duracionSegundos) || 60;
       const stats = await getVotingStats(assemblyId, preguntaId);
-      const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true, stats };
+      const resultados = await calculateWeightedResults(assemblyId, preguntaId);
+      const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true, stats, resultados };
 
       activeQuestions.set(assemblyId, activeQData);
       const roomName = `assembly_${assemblyId}`;
