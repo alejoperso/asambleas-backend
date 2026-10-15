@@ -16,10 +16,9 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] } });
 
-// CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN Y CLAVE SECRETA
+// CONFIGURACIÓN DE CREDENCIALES MAESTRAS DE SUPERADMIN
 const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL || 'contacto@ajaudiovisual.com';
 const SUPERADMIN_PASSWORD = process.env.SUPERADMIN_PASSWORD || 'Alfaleon2030';
-const SECRET_KEY = process.env.JWT_SECRET || 'AsambleasPH_Secret_Token_2026';
 
 // INICIALIZACIÓN DE RESEND CON API KEY
 const resend = new Resend(process.env.RESEND_API_KEY || 're_dummy_key');
@@ -31,131 +30,9 @@ const socketUserMap = new Map();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// HELPER PARA GENERAR TOKENS SEGUROS DE ACCIÓN EN PODERES
-function generatePowerActionToken(powerId, action) {
-  return crypto
-    .createHmac('sha256', SECRET_KEY)
-    .update(`${powerId}_${action}`)
-    .digest('hex');
-}
-
-// HELPER PARA RENDERIZAR RESPUESTA HTML AL REPRESENTANTE LEGAL
-function renderResponseHTML(title, message, isSuccess, headerColor = '#6366f1') {
-  return `
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>${title}</title>
-      <style>
-        body { font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
-        .card { background-color: #1e293b; border-radius: 16px; padding: 32px; max-width: 480px; width: 100%; text-align: center; border: 1px solid #334155; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
-        .badge { display: inline-block; padding: 8px 16px; border-radius: 9999px; font-weight: bold; font-size: 14px; margin-bottom: 16px; color: #fff; background-color: ${headerColor}; }
-        h1 { font-size: 20px; margin-bottom: 12px; color: #ffffff; }
-        p { font-size: 14px; color: #94a3b8; line-height: 1.6; margin-bottom: 24px; }
-        .btn { display: inline-block; background-color: #334155; color: #f1f5f9; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: bold; }
-        .btn:hover { background-color: #475569; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <div class="badge">${isSuccess ? '✓ OPERACIÓN EXITOSA' : '✕ ALERTA DE SISTEMA'}</div>
-        <h1>${title}</h1>
-        <p>${message}</p>
-        <a href="javascript:window.close();" class="btn">Cerrar esta ventana</a>
-      </div>
-    </body>
-    </html>
-  `;
-}
-
-// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA COMPLETO (7 TABLAS DE SISTEMA)
+// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA
 async function initDbSchema() {
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS asambleas (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        nombre_copropiedad VARCHAR(255) NOT NULL,
-        logo_url LONGTEXT NULL,
-        estado VARCHAR(50) DEFAULT 'programada',
-        zoom_embed_url LONGTEXT NULL,
-        zoom_meeting_id VARCHAR(100) NULL,
-        zoom_passcode VARCHAR(100) NULL,
-        zoom_password VARCHAR(100) NULL,
-        fecha_evento DATE NULL,
-        hora_inicio DATETIME NULL,
-        hora_cierre DATETIME NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS usuarios (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        assembly_id INT NOT NULL,
-        identificador_unico VARCHAR(100) NOT NULL,
-        nombre_completo VARCHAR(255) NOT NULL,
-        unidad VARCHAR(100) DEFAULT '---',
-        email VARCHAR(255) NULL,
-        password VARCHAR(255) NULL,
-        coeficiente DECIMAL(10,5) DEFAULT 0.00000,
-        rol VARCHAR(50) NOT NULL DEFAULT 'asistente',
-        estado VARCHAR(20) DEFAULT 'activo',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE KEY idx_assembly_user (assembly_id, identificador_unico)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS preguntas (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        assembly_id INT NOT NULL,
-        texto_pregunta TEXT NOT NULL,
-        duracion_segundos INT DEFAULT 60,
-        estado VARCHAR(20) DEFAULT 'borrador',
-        orden INT DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS opciones_pregunta (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        pregunta_id INT NOT NULL,
-        texto_opcion VARCHAR(255) NOT NULL,
-        orden INT DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS votos (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        assembly_id INT NOT NULL,
-        pregunta_id INT NOT NULL,
-        usuario_id INT NOT NULL,
-        opcion_id INT NOT NULL,
-        coeficiente_aplicado DECIMAL(10,5) NOT NULL DEFAULT 0.00000,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE KEY idx_user_question (pregunta_id, usuario_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS poderes (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        assembly_id INT NOT NULL,
-        otorgante_id INT NOT NULL,
-        apoderado_id INT NOT NULL,
-        documento_url LONGTEXT NULL,
-        estado VARCHAR(20) DEFAULT 'pendiente',
-        observaciones TEXT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE KEY idx_otorgante_assembly (assembly_id, otorgante_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-
     await db.query(`
       CREATE TABLE IF NOT EXISTS documentos (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -163,7 +40,7 @@ async function initDbSchema() {
         titulo VARCHAR(255) NOT NULL,
         archivo_url LONGTEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      )
     `);
 
     await db.query(`
@@ -175,14 +52,11 @@ async function initDbSchema() {
         rol VARCHAR(50) DEFAULT 'superadmin',
         estado VARCHAR(20) DEFAULT 'activo',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      )
     `);
 
     const alterQueries = [
       `ALTER TABLE usuarios MODIFY COLUMN rol VARCHAR(50) NOT NULL DEFAULT 'asistente'`,
-      `ALTER TABLE asambleas MODIFY COLUMN logo_url LONGTEXT NULL`,
-      `ALTER TABLE asambleas MODIFY COLUMN estado VARCHAR(50) DEFAULT 'programada'`,
-      `ALTER TABLE asambleas MODIFY COLUMN zoom_embed_url LONGTEXT NULL`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
@@ -192,7 +66,7 @@ async function initDbSchema() {
         await db.query(q);
       } catch (e) {}
     }
-    console.log('✅ Verificación y migración completa de las 7 tablas de base de datos.');
+    console.log('✅ Verificación y migración de esquema completada.');
   } catch (err) {
     console.warn('Advertencia en verificación de esquema:', err.message);
   }
@@ -285,115 +159,40 @@ async function getUserPowerDetails(userId, assemblyId) {
 }
 
 async function getUserEffectiveCoefficient(userId, assemblyId) {
-  if (!userId || userId <= 0) return 0;
   const { isRepresented } = await checkUserRepresentedStatus(userId, assemblyId);
   if (isRepresented) return 0;
 
   const [u] = await db.query(`SELECT coeficiente, rol FROM usuarios WHERE id = ?`, [userId]);
   if (u.length === 0) return 0;
-  const rolLower = (u[0].rol || '').toLowerCase();
-  if (['soporte', 'superadmin', 'moderador', 'administrador', 'representante_legal'].includes(rolLower) && (parseFloat(u[0].coeficiente) || 0) === 0) {
-    return 0;
-  }
+  if (u[0].rol === 'soporte') return 0;
 
   const propio = parseFloat(u[0].coeficiente) || 0;
   const { coefPoderes } = await getUserPowerDetails(userId, assemblyId);
   return propio + coefPoderes;
 }
 
-// HELPER PARA OBTENER EL ESTADO ACTUAL DE QUÓRUM Y CONECTADOS DE UNA ASAMBLEA
-async function computeQuorumAndConnected(assemblyId) {
-  const targetAssembly = parseInt(assemblyId) || 1;
-  const activeList = [];
-  const activeUserIds = new Set();
-
-  for (const [key, session] of activeSessions.entries()) {
-    if (parseInt(session.assemblyId) === targetAssembly) {
-      if (session.userId > 0) {
-        activeUserIds.add(session.userId);
-      }
-
-      const coefEfectivo = session.userId > 0
-        ? await getUserEffectiveCoefficient(session.userId, targetAssembly)
-        : 0;
-
-      activeList.push({
-        userId: session.userId,
-        identificadorUnico: session.identificador_unico || session.identificadorUnico,
-        nombreCompleto: session.nombreCompleto,
-        unidad: session.unidad,
-        rol: session.rol,
-        coeficiente: coefEfectivo
-      });
-    }
-  }
-
-  let totalQuorum = 0;
-  if (activeUserIds.size > 0) {
-    for (let uId of activeUserIds) {
-      totalQuorum += await getUserEffectiveCoefficient(uId, targetAssembly);
-    }
-  }
-
-  const quorumPercentage = totalQuorum.toFixed(4);
-  return { quorumPercentage, total: activeList.length, usuarios: activeList };
-}
-
-// CÁLCULO Y TRANSMISIÓN EXACTA DEL QUÓRUM Y DE LOS COEFICIENTES EN VIVO
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
-    const targetAssembly = parseInt(assemblyId) || 1;
-    const { quorumPercentage, total, usuarios } = await computeQuorumAndConnected(targetAssembly);
+    const activeUserIds = new Set();
+    for (const [key, session] of activeSessions.entries()) {
+      if (session.assemblyId === parseInt(assemblyId)) {
+        activeUserIds.add(session.userId);
+      }
+    }
 
-    io.to(`assembly_${targetAssembly}`).emit('quorum:update', { quorumPercentage });
-    io.to(`assembly_${targetAssembly}`).emit('users:connected_update', { total, usuarios });
+    if (activeUserIds.size === 0) {
+      io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage: "0.0000" });
+      return;
+    }
+
+    let totalQuorum = 0;
+    for (let uId of activeUserIds) {
+      totalQuorum += await getUserEffectiveCoefficient(uId, assemblyId);
+    }
+    const quorumPercentage = totalQuorum.toFixed(4);
+    io.to(`assembly_${assemblyId}`).emit('quorum:update', { quorumPercentage });
   } catch (err) {
     console.error('Error calculando quórum:', err);
-  }
-}
-
-async function getVotingStats(assemblyId, preguntaId) {
-  try {
-    const rawActiveUserIds = new Set();
-    for (const [key, session] of activeSessions.entries()) {
-      if (parseInt(session.assemblyId) === parseInt(assemblyId) && session.userId > 0) {
-        rawActiveUserIds.add(session.userId);
-      }
-    }
-
-    let totalConectados = 0;
-    for (const uId of rawActiveUserIds) {
-      const { isRepresented } = await checkUserRepresentedStatus(uId, assemblyId);
-      if (isRepresented) continue;
-
-      const [u] = await db.query(`SELECT coeficiente, rol FROM usuarios WHERE id = ?`, [uId]);
-      if (u.length === 0 || u[0].rol === 'soporte') continue;
-
-      const propioCoef = parseFloat(u[0].coeficiente) || 0;
-      if (propioCoef > 0) {
-        totalConectados += 1;
-      }
-
-      const { representadosAprobados } = await getUserPowerDetails(uId, assemblyId);
-      if (representadosAprobados && representadosAprobados.length > 0) {
-        for (const rep of representadosAprobados) {
-          if ((parseFloat(rep.coeficiente) || 0) > 0) {
-            totalConectados += 1;
-          }
-        }
-      }
-    }
-
-    const [rows] = await db.query(
-      `SELECT COUNT(DISTINCT usuario_id) AS totalVotaron FROM votos WHERE assembly_id = ? AND pregunta_id = ? AND coeficiente_aplicado > 0`,
-      [assemblyId, preguntaId]
-    );
-    const hanVotado = rows[0] ? parseInt(rows[0].totalVotaron) || 0 : 0;
-    const faltanPorVotar = Math.max(0, totalConectados - hanVotado);
-
-    return { totalConectados, hanVotado, faltanPorVotar };
-  } catch (err) {
-    return { totalConectados: 0, hanVotado: 0, faltanPorVotar: 0 };
   }
 }
 
@@ -419,21 +218,10 @@ async function calculateWeightedResults(assemblyId, preguntaId) {
   return results;
 }
 
-// REST API: CONSULTA DIRECTA DE QUÓRUM Y CONECTADOS EN VIVO
-app.get('/api/quorum/:assemblyId', async (req, res) => {
-  try {
-    const { assemblyId } = req.params;
-    const data = await computeQuorumAndConnected(assemblyId);
-    res.json({ ok: true, ...data });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
 // REST API: LOGIN DE ADMINISTRACIÓN Y SUPERADMIN
 app.post('/api/auth/admin-login', async (req, res) => {
   try {
-    const { email, password, assemblyId } = req.body;
+    const { email, password } = req.body;
     if (!email || !password) {
       return res.status(400).json({ ok: false, error: 'Correo y contraseña requeridos.' });
     }
@@ -459,8 +247,7 @@ app.post('/api/auth/admin-login', async (req, res) => {
     const [rows] = await db.query(
       `SELECT id, assembly_id, identificador_unico, nombre_completo, email, password, rol 
        FROM usuarios 
-       WHERE LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')
-       ORDER BY id DESC`,
+       WHERE LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')`,
       [cleanEmail]
     );
 
@@ -468,50 +255,26 @@ app.post('/api/auth/admin-login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Credenciales inválidas o sin permisos de gestión.' });
     }
 
-    let matchedUser = null;
-    if (assemblyId) {
-      matchedUser = rows.find(r => parseInt(r.assembly_id) === parseInt(assemblyId) && r.password && r.password.trim() !== '');
-    }
-    if (!matchedUser) {
-      matchedUser = rows.find(r => r.password && r.password.trim() !== '') || rows[0];
-    }
-
-    if (!matchedUser.password || matchedUser.password.trim() === '') {
+    const adminUser = rows[0];
+    if (!adminUser.password || adminUser.password.trim() === '') {
       return res.status(401).json({ ok: false, error: 'El usuario no tiene una contraseña configurada.' });
     }
 
-    let isMatch = await bcrypt.compare(cleanPass, matchedUser.password);
-    if (!isMatch) {
-      for (const candidate of rows) {
-        if (candidate.password && await bcrypt.compare(cleanPass, candidate.password)) {
-          matchedUser = candidate;
-          isMatch = true;
-          break;
-        }
-      }
-    }
-
+    const isMatch = await bcrypt.compare(cleanPass, adminUser.password);
     if (!isMatch) {
       return res.status(401).json({ ok: false, error: 'Contraseña incorrecta.' });
     }
 
-    if (assemblyId) {
-      const sameAssemblyRecord = rows.find(r => parseInt(r.assembly_id) === parseInt(assemblyId));
-      if (sameAssemblyRecord) {
-        matchedUser = sameAssemblyRecord;
-      }
-    }
-
-    const token = Buffer.from(`${matchedUser.rol}_${matchedUser.id}_${Date.now()}`).toString('base64');
+    const token = Buffer.from(`${adminUser.rol}_${adminUser.id}_${Date.now()}`).toString('base64');
     return res.json({
       ok: true,
       user: {
-        id: matchedUser.id,
-        nombre_completo: matchedUser.nombre_completo,
-        email: matchedUser.email,
-        rol: matchedUser.rol,
-        assembly_id: matchedUser.assembly_id,
-        identificador_unico: matchedUser.identificador_unico
+        id: adminUser.id,
+        nombre_completo: adminUser.nombre_completo,
+        email: adminUser.email,
+        rol: adminUser.rol,
+        assembly_id: adminUser.assembly_id,
+        identificador_unico: adminUser.identificador_unico
       },
       token
     });
@@ -559,14 +322,6 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
     if (password && password.trim() !== '') {
       const salt = await bcrypt.genSalt(10);
       hashedPassword = await bcrypt.hash(password.trim(), salt);
-    } else {
-      const [existing] = await db.query(
-        `SELECT password FROM usuarios WHERE LOWER(email) = ? AND password IS NOT NULL AND password != '' ORDER BY id DESC LIMIT 1`,
-        [cleanEmail]
-      );
-      if (existing.length > 0) {
-        hashedPassword = existing[0].password;
-      }
     }
 
     if (hashedPassword) {
@@ -599,7 +354,7 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
   }
 });
 
-// ENVIAR CORREO CON CREDENCIALES AL PERSONAL DE CONTROL
+// ENVIAR CORREO CON CREDENCIALES AL PERSONAL DE CONTROL (ADMIN, MODERADOR, SOPORTE)
 app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
@@ -629,16 +384,13 @@ app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(plainPassword, salt);
 
-    await db.query(
-      `UPDATE usuarios SET password = ? WHERE id = ? OR (LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal'))`,
-      [hashedPassword, user.id, user.email.trim().toLowerCase()]
-    );
+    await db.query(`UPDATE usuarios SET password = ? WHERE id = ?`, [hashedPassword, user.id]);
 
     const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
     const adminUrl = `${clientUrl}/admin.html?asamblea=${user.assembly_id || 1}`;
     const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
     const copropiedadNombre = user.nombre_copropiedad || 'Asamblea Virtual';
-    const rolNombre = user.rol === 'administrador' ? 'Administrador' : user.rol === 'moderador' ? 'Moderador' : user.rol === 'representante_legal' ? 'Representante Legal' : 'Soporte Técnico';
+    const rolNombre = user.rol === 'administrador' ? 'Administrador' : user.rol === 'moderador' ? 'Moderador' : 'Soporte Técnico';
 
     const emailResult = await resend.emails.send({
       from: `Plataforma Asambleas <${fromSender}>`,
@@ -992,41 +744,6 @@ app.post('/api/superadmin/users/bulk', async (req, res) => {
   }
 });
 
-// ACTUALIZACIÓN DIRECTA DE USUARIO DEL PADRÓN POR ID NUMÉRICO (EVITA DUPLICADOS AL CAMBIAR IDENTIFICADOR)
-app.put('/api/superadmin/users/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { assemblyId, identificadorUnico, nombreCompleto, email, unidad, coeficiente } = req.body;
-
-    if (!identificadorUnico || identificadorUnico.toString().trim() === '') {
-      return res.status(400).json({ ok: false, error: 'El identificador único es obligatorio.' });
-    }
-
-    const cleanIdUnico = identificadorUnico.toString().trim().toUpperCase();
-    const cleanNombre = (nombreCompleto || cleanIdUnico).toString().trim();
-    const cleanEmail = (email || '').toString().trim().toLowerCase();
-    const cleanUnidad = (unidad || '---').toString().trim();
-    const cleanCoef = isNaN(parseFloat(coeficiente)) ? 0.00000 : parseFloat(coeficiente);
-
-    await db.query(
-      `UPDATE usuarios 
-       SET identificador_unico = ?, nombre_completo = ?, email = ?, unidad = ?, coeficiente = ? 
-       WHERE id = ?`,
-      [cleanIdUnico, cleanNombre, cleanEmail, cleanUnidad, cleanCoef, id]
-    );
-
-    if (assemblyId) {
-      await updateAndBroadcastQuorum(assemblyId);
-      io.to(`assembly_${assemblyId}`).emit('users:updated');
-    }
-
-    res.json({ ok: true, message: 'Usuario actualizado correctamente.' });
-  } catch (err) {
-    console.error('Error actualizando usuario del padrón:', err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -1219,17 +936,8 @@ app.put('/api/assemblies/:id/info', async (req, res) => {
   try {
     const { id } = req.params;
     const { nombreCopropiedad, logoBase64 } = req.body;
-
-    if (logoBase64 && logoBase64.trim() !== '') {
-      await db.query(`UPDATE asambleas SET nombre_copropiedad = ?, logo_url = ? WHERE id = ?`, [nombreCopropiedad, logoBase64, id]);
-      io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl: logoBase64 });
-    } else {
-      await db.query(`UPDATE asambleas SET nombre_copropiedad = ? WHERE id = ?`, [nombreCopropiedad, id]);
-      const [rows] = await db.query(`SELECT logo_url FROM asambleas WHERE id = ?`, [id]);
-      const currentLogo = rows.length > 0 ? rows[0].logo_url : null;
-      io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl: currentLogo });
-    }
-
+    await db.query(`UPDATE asambleas SET nombre_copropiedad = ?, logo_url = ? WHERE id = ?`, [nombreCopropiedad, logoBase64, id]);
+    io.to(`assembly_${id}`).emit('assembly:updated', { nombreCopropiedad, logoUrl: logoBase64 });
     res.json({ ok: true, message: 'Información de copropiedad actualizada.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1270,22 +978,14 @@ app.post('/api/documents', async (req, res) => {
 app.delete('/api/documents/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    let targetAssembly = 1;
-
     try {
-      const [doc] = await db.query(`SELECT assembly_id FROM documentos WHERE id = ?`, [id]);
-      if (doc.length > 0) targetAssembly = doc[0].assembly_id;
       await db.query(`DELETE FROM documentos WHERE id = ?`, [id]);
     } catch (e) {
       const idx = memoryDocuments.findIndex(d => d.id == id);
-      if (idx !== -1) {
-        targetAssembly = memoryDocuments[idx].assemblyId || 1;
-        memoryDocuments.splice(idx, 1);
-      }
+      if (idx !== -1) memoryDocuments.splice(idx, 1);
     }
-
-    io.to(`assembly_${targetAssembly}`).emit('documents:updated');
-    res.json({ ok: true, message: 'Documento eliminado exitosamente.' });
+    io.to(`assembly_1`).emit('documents:updated');
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1294,13 +994,10 @@ app.delete('/api/documents/:id', async (req, res) => {
 app.get('/api/questions/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
-    const [preguntas] = await db.query(`SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY id DESC`, [assemblyId]);
+    const [preguntas] = await db.query(`SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC`, [assemblyId]);
     for (let p of preguntas) {
       const [opciones] = await db.query(`SELECT * FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`, [p.id]);
       p.opciones = opciones;
-      if (p.estado === 'cerrada' || p.estado === 'activa') {
-        p.resultados = await calculateWeightedResults(assemblyId, p.id);
-      }
     }
     res.json({ ok: true, preguntas });
   } catch (err) {
@@ -1362,20 +1059,16 @@ app.delete('/api/questions/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { assemblyId } = req.query;
-
     await db.query(`DELETE FROM votos WHERE pregunta_id = ?`, [id]);
     await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id = ?`, [id]);
     await db.query(`DELETE FROM preguntas WHERE id = ?`, [id]);
-
-    const targetAssembly = assemblyId || 1;
-    io.to(`assembly_${targetAssembly}`).emit('questions:updated');
-    res.json({ ok: true, message: 'Pregunta y sus votos fueron eliminados correctamente.' });
+    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
+    res.json({ ok: true, message: 'Pregunta eliminada.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// OBTENCIÓN DE PODERES CALCULANDO EL COEFICIENTE EFECTIVO TOTAL ACUMULADO DEL APODERADO
 app.get('/api/powers/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1390,63 +1083,9 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
        ORDER BY p.created_at DESC`,
       [assemblyId]
     );
-
-    for (let pod of poderes) {
-      pod.apoderado_coef_efectivo = await getUserEffectiveCoefficient(pod.apoderado_num_id, assemblyId);
-    }
-
     res.json({ ok: true, poderes });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ACCIÓN RÁPIDA DE APROBACIÓN / RECHAZO DESDE EL CORREO DEL REPRESENTANTE LEGAL
-app.get('/api/powers/:id/quick-action', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status, token } = req.query;
-
-    if (!id || !status || !token) {
-      return res.status(400).send(renderResponseHTML('Error de Solicitud', 'Parámetros incompletos en el enlace.', false));
-    }
-
-    const expectedToken = generatePowerActionToken(id, status);
-    if (token !== expectedToken) {
-      return res.status(403).send(renderResponseHTML('Enlace Inválido', 'El token de seguridad no es válido o ha expirado.', false));
-    }
-
-    const [podRows] = await db.query(
-      `SELECT p.id, p.assembly_id, p.estado, u_ot.nombre_completo AS otorgante, u_ap.nombre_completo AS apoderado 
-       FROM poderes p
-       JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
-       JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
-       WHERE p.id = ?`,
-      [id]
-    );
-
-    if (podRows.length === 0) {
-      return res.status(404).send(renderResponseHTML('No Encontrado', 'El poder especificado no existe.', false));
-    }
-
-    const poder = podRows[0];
-    const nuevoEstado = status === 'autorizado' ? 'autorizado' : 'rechazado';
-    const observacion = `Procesado mediante acción directa desde correo electrónico el ${new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' })}`;
-
-    await db.query(`UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`, [nuevoEstado, observacion, id]);
-
-    await updateAndBroadcastQuorum(poder.assembly_id);
-    io.to(`assembly_${poder.assembly_id}`).emit('powers:updated');
-
-    const colorHeader = nuevoEstado === 'autorizado' ? '#10b981' : '#ef4444';
-    const tituloResultado = nuevoEstado === 'autorizado' ? 'Poder Aprobado y Autorizado' : 'Poder Rechazado';
-    const mensajeDetalle = `El poder otorgado por <strong>${poder.otorgante}</strong> a favor de <strong>${poder.apoderado}</strong> ha sido marcado como <strong>${nuevoEstado.toUpperCase()}</strong> correctamente.`;
-
-    return res.send(renderResponseHTML(tituloResultado, mensajeDetalle, true, colorHeader));
-
-  } catch (err) {
-    console.error('Error en quick-action poder:', err);
-    return res.status(500).send(renderResponseHTML('Error Interno', 'No se pudo procesar la solicitud.', false));
   }
 });
 
@@ -1488,28 +1127,12 @@ app.delete('/api/powers/:id', async (req, res) => {
 app.post('/api/powers/manual', async (req, res) => {
   try {
     const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
-    const targetAssembly = parseInt(assemblyId) || 1;
-    const cleanOtorgante = (otorganteId || '').toString().trim().toUpperCase();
-    const cleanApoderado = (apoderadoIdentificador || '').toString().trim().toUpperCase();
-
-    if (!cleanOtorgante || !cleanApoderado) {
-      return res.status(400).json({ ok: false, error: 'Identificador del otorgante y del apoderado son requeridos.' });
-    }
-
-    let [otorganteRows] = await db.query(
-      `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
-      [targetAssembly, cleanOtorgante, cleanOtorgante, parseInt(cleanOtorgante) || 0]
-    );
-
-    if (otorganteRows.length === 0) {
-      return res.status(404).json({ ok: false, error: `El inmueble/otorgante [${cleanOtorgante}] no fue encontrado en la base de datos.` });
-    }
-
-    const otorganteNumId = otorganteRows[0].id;
+    const targetAssembly = assemblyId || 1;
+    const targetApoderadoId = apoderadoIdentificador.toString().trim().toUpperCase();
 
     let [apoderadoRows] = await db.query(
-      `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
-      [targetAssembly, cleanApoderado, cleanApoderado, parseInt(cleanApoderado) || 0]
+      `SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
+      [targetAssembly, targetApoderadoId]
     );
 
     let apoderadoNumId;
@@ -1517,152 +1140,48 @@ app.post('/api/powers/manual', async (req, res) => {
       const [ins] = await db.query(
         `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
          VALUES (?, ?, ?, 'Apoderado Externo', 0.00000, 'asistente')`,
-        [targetAssembly, cleanApoderado, apoderadoNombre || cleanApoderado]
+        [targetAssembly, targetApoderadoId, apoderadoNombre || 'Apoderado Externo']
       );
       apoderadoNumId = ins.insertId;
     } else {
       apoderadoNumId = apoderadoRows[0].id;
     }
 
-    if (otorganteNumId === apoderadoNumId) {
-      return res.status(400).json({ ok: false, error: 'El otorgante y el apoderado no pueden ser la misma persona.' });
-    }
-
     await db.query(
       `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado, observaciones)
-       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMIN', 'autorizado', 'Asignado manualmente por Representante/Admin')
+       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMIN', 'autorizado', 'Asignado manualmente')
        ON DUPLICATE KEY UPDATE apoderado_id = VALUES(apoderado_id), estado = 'autorizado'`,
-      [targetAssembly, otorganteNumId, apoderadoNumId]
+      [targetAssembly, otorganteId, apoderadoNumId]
     );
 
     await updateAndBroadcastQuorum(targetAssembly);
     io.to(`assembly_${targetAssembly}`).emit('powers:updated');
-    res.json({ ok: true, message: 'Poder asignado y autorizado correctamente.' });
+    res.json({ ok: true, message: 'Poder asignado correctamente.' });
   } catch (err) {
-    console.error('Error en asignar poder manual:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// CARGA DE PODERES POR PARTE DE USUARIOS CON BOTONES DE ACCIÓN DIRECTA AL CORREO DEL REPRESENTANTE
 app.post('/api/powers', async (req, res) => {
   try {
     const { assemblyId, otorganteUnico, apoderadoUnico, documentoUrl } = req.body;
-    const targetAssembly = parseInt(assemblyId) || 1;
-    const cleanOtorgante = (otorganteUnico || '').toString().trim().toUpperCase();
-    const cleanApoderado = (apoderadoUnico || '').toString().trim().toUpperCase();
-
-    const [otorgantes] = await db.query(
-      `SELECT id, nombre_completo, unidad FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-      [targetAssembly, cleanOtorgante]
-    );
-    const [apoderados] = await db.query(
-      `SELECT id, nombre_completo, unidad FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-      [targetAssembly, cleanApoderado]
-    );
+    const [otorgantes] = await db.query(`SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`, [assemblyId || 1, otorganteUnico.toString().trim().toUpperCase()]);
+    const [apoderados] = await db.query(`SELECT id FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`, [assemblyId || 1, apoderadoUnico.toString().trim().toUpperCase()]);
 
     if (otorgantes.length === 0) return res.status(400).json({ ok: false, error: 'El otorgante no existe.' });
     if (apoderados.length === 0) return res.status(400).json({ ok: false, error: 'El apoderado no existe.' });
 
-    const otorganteUser = otorgantes[0];
-    const apoderadoUser = apoderados[0];
-
-    const [resultPoder] = await db.query(
+    await db.query(
       `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado) VALUES (?, ?, ?, ?, 'pendiente')`,
-      [targetAssembly, otorganteUser.id, apoderadoUser.id, documentoUrl]
+      [assemblyId || 1, otorgantes[0].id, apoderados[0].id, documentoUrl]
     );
-
-    const powerId = resultPoder.insertId;
-    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
-
-    try {
-      const [reps] = await db.query(
-        `SELECT email, nombre_completo FROM usuarios 
-         WHERE assembly_id = ? AND rol IN ('representante_legal', 'administrador') AND email IS NOT NULL AND email != ''`,
-        [targetAssembly]
-      );
-
-      const [asamblea] = await db.query(`SELECT nombre_copropiedad FROM asambleas WHERE id = ?`, [targetAssembly]);
-      const nombreCopropiedad = asamblea.length > 0 ? asamblea[0].nombre_copropiedad : 'Asamblea Virtual';
-
-      if (reps.length > 0) {
-        const emailsDestino = reps.map(r => r.email);
-        const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
-        const serverBaseUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
-
-        const tokenApprove = generatePowerActionToken(powerId, 'autorizado');
-        const tokenReject = generatePowerActionToken(powerId, 'rechazado');
-
-        const approveLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=autorizado&token=${tokenApprove}`;
-        const rejectLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=rechazado&token=${tokenReject}`;
-
-        let attachments = [];
-        if (documentoUrl && documentoUrl.startsWith('data:')) {
-          const matches = documentoUrl.match(/^data:(.+);base64,(.+)$/);
-          if (matches) {
-            const mimeType = matches[1];
-            const base64Content = matches[2];
-            let ext = 'pdf';
-            if (mimeType.includes('png')) ext = 'png';
-            else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) ext = 'jpg';
-
-            attachments.push({
-              filename: `Poder_${cleanOtorgante}_a_${cleanApoderado}.${ext}`,
-              content: Buffer.from(base64Content, 'base64')
-            });
-          }
-        }
-
-        await resend.emails.send({
-          from: `${nombreCopropiedad} <${fromSender}>`,
-          to: emailsDestino,
-          subject: `🚨 Alerta: Nuevo Poder Pendiente por Autorizar - ${nombreCopropiedad}`,
-          text: `Atención Representante Legal, se ha recibido un nuevo poder pendiente por aprobación.\nOtorgante: ${otorganteUser.nombre_completo} (${otorganteUser.unidad})\nApoderado: ${apoderadoUser.nombre_completo} (${apoderadoUser.unidad})\nAprobar: ${approveLink}\nRechazar: ${rejectLink}`,
-          html: `
-            <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
-              <h2 style="color: #f59e0b; text-align: center; margin-bottom: 20px;">⚠️ Nuevo Poder Pendiente de Autorización</h2>
-              <p style="font-size: 14px; line-height: 1.6;">Estimado(a) Representante Legal / Administrador,</p>
-              <p style="font-size: 14px; line-height: 1.6;">Se ha radicado una solicitud de poder en la plataforma para la copropiedad <strong>${nombreCopropiedad}</strong>.</p>
-              
-              <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #f59e0b; margin: 20px 0;">
-                <p style="margin: 6px 0; font-size: 14px;"><strong>Otorgante:</strong> ${otorganteUser.nombre_completo} (Unidad: ${otorganteUser.unidad})</p>
-                <p style="margin: 6px 0; font-size: 14px;"><strong>Apoderado:</strong> ${apoderadoUser.nombre_completo} (Unidad: ${apoderadoUser.unidad})</p>
-                <p style="margin: 6px 0; font-size: 14px;"><strong>Estado:</strong> <span style="color: #f59e0b; font-weight: bold;">PENDIENTE DE REVISIÓN</span></p>
-              </div>
-
-              <!-- BOTONES DE ACCIÓN DIRECTA -->
-              <div style="text-align: center; margin: 25px 0;">
-                <a href="${approveLink}" target="_blank" style="background-color: #10b981; color: #ffffff; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block; margin-right: 10px; font-size: 14px;">
-                  ✓ APROBAR PODER
-                </a>
-                <a href="${rejectLink}" target="_blank" style="background-color: #ef4444; color: #ffffff; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block; font-size: 14px;">
-                  ✕ RECHAZAR PODER
-                </a>
-              </div>
-
-              <p style="font-size: 12px; color: #cbd5e1; line-height: 1.6; text-align: center;">
-                El documento adjunto se encuentra disponible en este correo. Puede hacer clic en cualquiera de los botones superiores para autorizar o rechazar este poder de manera inmediata.
-              </p>
-
-              <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
-                Notificación automática del Sistema de Asambleas Virtuales.
-              </p>
-            </div>
-          `,
-          attachments: attachments
-        });
-      }
-    } catch (emailErr) {
-      console.error('Error al enviar correo de alerta de poder al representante:', emailErr);
-    }
-
-    res.json({ ok: true, message: 'Poder registrado exitosamente y notificación enviada al representante legal.' });
+    io.to(`assembly_${assemblyId || 1}`).emit('powers:updated');
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// OBTENCIÓN DE USUARIOS CON SU COEFICIENTE EFECTIVO TOTAL
 app.get('/api/users/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
@@ -1680,11 +1199,6 @@ app.get('/api/users/:assemblyId', async (req, res) => {
       sql += ` LIMIT 50`;
     }
     const [usuarios] = await db.query(sql, params);
-
-    for (let u of usuarios) {
-      u.coeficiente_efectivo = await getUserEffectiveCoefficient(u.id, assemblyId);
-    }
-
     res.json({ ok: true, usuarios });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1735,7 +1249,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
     );
 
     const [preguntas] = await db.query(
-      `SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY id DESC`,
+      `SELECT * FROM preguntas WHERE assembly_id = ? ORDER BY orden ASC, id ASC`,
       [id]
     );
 
@@ -1757,7 +1271,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
 
     const activeUserIds = new Set();
     for (const [key, session] of activeSessions.entries()) {
-      if (parseInt(session.assemblyId) === parseInt(id) && session.userId > 0) {
+      if (session.assemblyId === parseInt(id)) {
         activeUserIds.add(session.userId);
       }
     }
@@ -1791,30 +1305,20 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERACIÓN DE FIRMA JWT OFICIAL PARA ZOOM MEETING SDK
 app.post('/api/zoom/signature', (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
-    const sdkKey = (process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w').trim();
-    const sdkSecret = (process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6').trim();
+    const sdkKey = process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w';
+    const sdkSecret = process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6';
 
     const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
     if (!cleanMn || isNaN(cleanMn)) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
 
-    const roleNum = parseInt(role, 10) === 1 ? 1 : 0;
     const iat = Math.floor(Date.now() / 1000) - 30;
     const exp = iat + 60 * 60 * 2;
 
     const oHeader = { alg: 'HS256', typ: 'JWT' };
-    const oPayload = {
-      sdkKey: sdkKey,
-      appKey: sdkKey,
-      mn: cleanMn,
-      role: roleNum,
-      iat: iat,
-      exp: exp,
-      tokenExp: exp
-    };
+    const oPayload = { sdkKey, appKey: sdkKey, mn: cleanMn, role: parseInt(role || 0, 10), iat, exp, tokenExp: exp };
 
     const sHeader = toBase64Url(JSON.stringify(oHeader));
     const sPayload = toBase64Url(JSON.stringify(oPayload));
@@ -1854,12 +1358,12 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.1.0-master' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.0.0-master' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
 
-  socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password, isConsoleAdmin, rolConsola, nombreConsola }) => {
+  socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password }) => {
     try {
       const targetAssembly = parseInt(assemblyId) || 1;
       const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
@@ -1872,44 +1376,6 @@ io.on('connection', (socket) => {
          WHERE assembly_id = ? AND (LOWER(email) = ? OR UPPER(identificador_unico) = ?)`,
         [targetAssembly, targetEmail || targetId.toLowerCase(), targetId]
       );
-
-      if (rows.length === 0 && (targetEmail || targetId)) {
-        const [controlRows] = await db.query(
-          `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol 
-           FROM usuarios 
-           WHERE (LOWER(email) = ? OR UPPER(identificador_unico) = ?) 
-             AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')
-           ORDER BY id DESC LIMIT 1`,
-          [targetEmail || targetId.toLowerCase(), targetId]
-        );
-        if (controlRows.length > 0) {
-          rows = [{
-            ...controlRows[0],
-            coeficiente: 0.00000
-          }];
-        }
-      }
-
-      if (
-        rows.length === 0 &&
-        (
-          targetId === 'SUPERADMIN' ||
-          targetId.startsWith('ADMIN-') ||
-          targetId.startsWith('MODERADOR-') ||
-          targetId.startsWith('REPRESENTANTE_LEGAL-') ||
-          targetEmail === SUPERADMIN_EMAIL.toLowerCase() ||
-          isConsoleAdmin
-        )
-      ) {
-        rows = [{
-          id: 0,
-          identificador_unico: targetId || 'SUPERADMIN',
-          nombre_completo: nombreConsola || 'Consola de Control',
-          unidad: 'CONTROL',
-          coeficiente: 0.00000,
-          rol: rolConsola || 'superadmin'
-        }];
-      }
 
       if (rows.length === 0 && targetId.startsWith('SOPORTE')) {
         const [ins] = await db.query(
@@ -1924,7 +1390,7 @@ io.on('connection', (socket) => {
 
       const user = rows[0];
 
-      if (!isConsoleAdmin && user.password && user.password.trim() !== '' && user.rol === 'asistente') {
+      if (user.password && user.password.trim() !== '' && user.rol === 'asistente') {
         if (!targetPassword) {
           return socket.emit('auth:error', 'Ingresa tu contraseña.');
         }
@@ -1935,32 +1401,19 @@ io.on('connection', (socket) => {
       }
 
       const userId = user.id;
-      const isControlRole = ['superadmin', 'administrador', 'moderador', 'representante_legal', 'soporte'].includes((user.rol || '').toLowerCase());
-      const sessionKey = (isConsoleAdmin || userId === 0)
-        ? `${targetAssembly}_CONSOLE_${userId}_${socket.id}`
-        : `${targetAssembly}_${userId}`;
+      const sessionKey = `${targetAssembly}_${userId}`;
 
-      if (!isConsoleAdmin && userId > 0 && !isControlRole && activeSessions.has(sessionKey)) {
+      if (activeSessions.has(sessionKey)) {
         const existingSession = activeSessions.get(sessionKey);
         if (existingSession.socketId !== socket.id) {
           io.to(existingSession.socketId).emit('auth:kicked', { message: 'Tu sesión ha sido iniciada en otro dispositivo.' });
         }
       }
 
-      if (!isConsoleAdmin) {
-        activeSessions.set(sessionKey, {
-          userId,
-          assemblyId: targetAssembly,
-          socketId: socket.id,
-          identificadorUnico: user.identificador_unico,
-          nombreCompleto: user.nombre_completo,
-          unidad: user.unidad,
-          rol: user.rol
-        });
-        socketUserMap.set(socket.id, sessionKey);
-        socket.sessionKey = sessionKey;
-      }
+      activeSessions.set(sessionKey, { userId, assemblyId: targetAssembly, socketId: socket.id, identificadorUnico: user.identificador_unico, nombreCompleto: user.nombre_completo, unidad: user.unidad, rol: user.rol });
+      socketUserMap.set(socket.id, sessionKey);
 
+      socket.sessionKey = sessionKey;
       socket.assemblyId = targetAssembly;
       socket.userId = userId;
 
@@ -1970,7 +1423,7 @@ io.on('connection', (socket) => {
       const { coefPoderes, representadosAprobados, representadosPendientes, isRepresented } = await getUserPowerDetails(userId, targetAssembly);
       user.coeficientePropio = parseFloat(user.coeficiente) || 0;
       user.coeficientePoderes = coefPoderes;
-      user.coeficienteEfectivo = (isRepresented || user.rol === 'soporte' || userId === 0) ? 0 : (user.coeficientePropio + coefPoderes);
+      user.coeficienteEfectivo = (isRepresented || user.rol === 'soporte') ? 0 : (user.coeficientePropio + coefPoderes);
       user.isRepresented = isRepresented;
       user.poderesAprobados = representadosAprobados;
       user.poderesPendientes = representadosPendientes;
@@ -1980,10 +1433,8 @@ io.on('connection', (socket) => {
 
       if (activeQuestions.has(targetAssembly)) {
         const activeQ = activeQuestions.get(targetAssembly);
-        const stats = await getVotingStats(targetAssembly, activeQ.id);
-        const resultados = await calculateWeightedResults(targetAssembly, activeQ.id);
         const [votoUsuario] = await db.query(`SELECT opcion_id FROM votos WHERE pregunta_id = ? AND usuario_id = ?`, [activeQ.id, userId]);
-        socket.emit('voting:current_state', { ...activeQ, stats, resultados, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
+        socket.emit('voting:current_state', { ...activeQ, myCurrentVote: votoUsuario.length > 0 ? votoUsuario[0].opcion_id : null });
       }
     } catch (error) {
       console.error('Error al autenticar socket:', error);
@@ -1991,37 +1442,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('auth:refresh_user', async () => {
-    try {
-      const { assemblyId, userId } = socket;
-      if (!assemblyId || !userId) return;
-
-      const [rows] = await db.query(
-        `SELECT id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol FROM usuarios WHERE id = ?`,
-        [userId]
-      );
-      if (rows.length === 0) return;
-
-      const user = rows[0];
-      const { coefPoderes, representadosAprobados, representadosPendientes, isRepresented } = await getUserPowerDetails(userId, assemblyId);
-      user.coeficientePropio = parseFloat(user.coeficiente) || 0;
-      user.coeficientePoderes = coefPoderes;
-      user.coeficienteEfectivo = (isRepresented || user.rol === 'soporte') ? 0 : (user.coeficientePropio + coefPoderes);
-      user.isRepresented = isRepresented;
-      user.poderesAprobados = representadosAprobados;
-      user.poderesPendientes = representadosPendientes;
-
-      socket.emit('user:coef_updated', { user });
-    } catch (err) {
-      console.error('Error en auth:refresh_user:', err);
-    }
-  });
-
   socket.on('chat:message', ({ texto, emisor, unidad }) => {
     const targetAssembly = socket.assemblyId || 1;
     const msgData = {
       id: Date.now(),
-      assemblyId: targetAssembly,
       texto,
       emisor: emisor || 'Asistente',
       unidad: unidad || '---',
@@ -2042,9 +1466,7 @@ io.on('connection', (socket) => {
       if (preguntas.length === 0) return;
 
       const duracion = parseInt(duracionSegundos) || 60;
-      const stats = await getVotingStats(assemblyId, preguntaId);
-      const resultados = await calculateWeightedResults(assemblyId, preguntaId);
-      const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true, stats, resultados };
+      const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true };
 
       activeQuestions.set(assemblyId, activeQData);
       const roomName = `assembly_${assemblyId}`;
@@ -2066,9 +1488,8 @@ io.on('connection', (socket) => {
 
           await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ?`, [preguntaId]);
           const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
-          const finalStats = await getVotingStats(assemblyId, preguntaId);
 
-          io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults, stats: finalStats });
+          io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults });
           io.to(roomName).emit('questions:updated');
           activeQuestions.delete(assemblyId);
         }
@@ -2091,10 +1512,9 @@ io.on('connection', (socket) => {
 
       await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
       const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
-      const finalStats = await getVotingStats(assemblyId, preguntaId);
 
       const roomName = `assembly_${assemblyId}`;
-      io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults, stats: finalStats });
+      io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults });
       io.to(roomName).emit('questions:updated');
     } catch (error) {
       console.error('Error al detener votación:', error);
@@ -2114,49 +1534,20 @@ io.on('connection', (socket) => {
         return socket.emit('vote:rejected', { message: `No puedes votar directamente. Tus derechos de voto están delegados por poder autorizado a ${apoderadoNombre}.` });
       }
 
-      const [poderesAprobados] = await db.query(
-        `SELECT p.otorgante_id, u.coeficiente
-         FROM poderes p
-         JOIN usuarios u ON p.otorgante_id = u.id
-         WHERE p.apoderado_id = ? AND p.assembly_id = ? AND p.estado = 'autorizado'`,
-        [userId, assemblyId]
-      );
-
-      const [u] = await db.query(`SELECT id, coeficiente, rol FROM usuarios WHERE id = ?`, [userId]);
-      if (u.length === 0) return;
-
-      const voterList = [];
-
-      if (u[0].rol !== 'soporte') {
-        const propioCoef = parseFloat(u[0].coeficiente) || 0;
-        if (propioCoef > 0 || poderesAprobados.length === 0) {
-          voterList.push({ usuarioId: u[0].id, coef: propioCoef });
-        }
-      }
-
-      for (const pod of poderesAprobados) {
-        voterList.push({ usuarioId: pod.otorgante_id, coef: parseFloat(pod.coeficiente) || 0 });
-      }
-
-      if (voterList.length === 0) {
+      const efCoef = await getUserEffectiveCoefficient(userId, assemblyId);
+      if (efCoef <= 0) {
         return socket.emit('vote:rejected', { message: 'Tu coeficiente habilitado de voto es 0.0000%.' });
       }
 
-      for (const target of voterList) {
-        await db.query(
-          `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
-           VALUES (?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE opcion_id = VALUES(opcion_id), coeficiente_aplicado = VALUES(coeficiente_aplicado)`,
-          [assemblyId, currentQ.id, target.usuarioId, opcionId, target.coef]
-        );
-      }
-
+      await db.query(
+        `INSERT INTO votos (assembly_id, pregunta_id, usuario_id, opcion_id, coeficiente_aplicado)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE opcion_id = VALUES(opcion_id), coeficiente_aplicado = VALUES(coeficiente_aplicado)`,
+        [assemblyId, currentQ.id, userId, opcionId, efCoef]
+      );
       socket.emit('vote:confirmed', { opcionId });
-      
       const updatedResults = await calculateWeightedResults(assemblyId, currentQ.id);
-      const stats = await getVotingStats(assemblyId, currentQ.id);
-      
-      io.to(`assembly_${assemblyId}`).emit('voting:results_update', { preguntaId: currentQ.id, resultados: updatedResults, stats });
+      io.to(`assembly_${assemblyId}`).emit('voting:results_update', { resultados: updatedResults });
     } catch (error) {
       console.error('Error al registrar voto:', error);
     }
@@ -2175,4 +1566,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.1.0-master corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.0.0-master corriendo en puerto ${PORT}`));
