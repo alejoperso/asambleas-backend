@@ -29,7 +29,7 @@ const activeQuestions = new Map();
 const timerIntervals = new Map();
 const activeSessions = new Map();
 const socketUserMap = new Map();
-const assemblyChatActive = new Map(); // Control de pausa de chat por asamblea
+const assemblyChatActive = new Map(); // Control de pausa/activación de chat por asamblea
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -1809,7 +1809,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM INCORPORANDO LAS NUEVAS CREDENCIALES
+// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM CON CREDENCIALES ACTUALIZADAS
 app.post('/api/zoom/signature', async (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
@@ -1994,6 +1994,12 @@ io.on('connection', (socket) => {
       user.poderesPendientes = representadosPendientes;
 
       socket.emit('auth:success', { user, room: roomName });
+
+      // ENVIAR HISTORIAL Y ESTADO DEL CHAT AL CONECTAR
+      const chatHistoryAssembly = memoryChat.filter(m => parseInt(m.assemblyId) === targetAssembly);
+      const isPausedNow = assemblyChatActive.get(targetAssembly) === false;
+      socket.emit('chat:history', { messages: chatHistoryAssembly, paused: isPausedNow });
+
       await updateAndBroadcastQuorum(targetAssembly);
 
       if (activeQuestions.has(targetAssembly)) {
@@ -2035,19 +2041,44 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('chat:message', ({ texto, emisor, unidad }) => {
-    const targetAssembly = socket.assemblyId || 1;
+  // EVENTOS DEL CANAL DE CHAT OFICIAL Y MODERACIÓN
+  socket.on('chat:message', ({ assemblyId, texto, emisor, unidad, esOficial }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    const isPaused = assemblyChatActive.get(targetAssembly) === false;
+
+    // Si el chat está pausado por el moderador, solo permitir comunicados oficiales
+    if (isPaused && !esOficial) {
+      return;
+    }
+
     const msgData = {
       id: Date.now(),
       assemblyId: targetAssembly,
-      texto,
+      texto: (texto || '').toString().trim().slice(0, 300),
       emisor: emisor || 'Asistente',
       unidad: unidad || '---',
+      esOficial: !!esOficial,
       hora: new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit' })
     };
     memoryChat.push(msgData);
     if (memoryChat.length > 100) memoryChat.shift();
     io.to(`assembly_${targetAssembly}`).emit('chat:broadcast', msgData);
+  });
+
+  socket.on('admin:toggle_chat', ({ assemblyId, paused }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    assemblyChatActive.set(targetAssembly, !paused);
+    io.to(`assembly_${targetAssembly}`).emit('chat:status', { paused: !!paused });
+  });
+
+  socket.on('admin:clear_chat', ({ assemblyId }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    for (let i = memoryChat.length - 1; i >= 0; i--) {
+      if (parseInt(memoryChat[i].assemblyId) === targetAssembly) {
+        memoryChat.splice(i, 1);
+      }
+    }
+    io.to(`assembly_${targetAssembly}`).emit('chat:cleared');
   });
 
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
