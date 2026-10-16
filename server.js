@@ -1808,12 +1808,12 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM SINCRONIZADO CON RELOJ DE ZOOM.US
+// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM SINCRONIZADO CON NUEVAS CREDENCIALES
 app.post('/api/zoom/signature', async (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
-    const sdkKey = (process.env.ZOOM_SDK_KEY || 'az3IqLFfQTiiF7dYI6Ka2w').trim();
-    const sdkSecret = (process.env.ZOOM_SDK_SECRET || 'HUJ1kfoykJu5CXGMl5ZXn2txqnS5iPM6').trim();
+    const sdkKey = (process.env.ZOOM_SDK_KEY || 'dPDveYuySJKLhCdur6gOiQ').trim();
+    const sdkSecret = (process.env.ZOOM_SDK_SECRET || 'eunmyWxjZ36p17tn2mTPzLvV2hRXFLwc').trim();
 
     const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
     if (!cleanMn || isNaN(cleanMn)) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
