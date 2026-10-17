@@ -29,9 +29,21 @@ const activeQuestions = new Map();
 const timerIntervals = new Map();
 const activeSessions = new Map();
 const socketUserMap = new Map();
-const assemblyChatActive = new Map(); // Control de pausa/activación de chat por asamblea
+
+// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT POR ASAMBLEA
+const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
+const assemblyPinnedMessage = new Map(); // Mensaje anclado actual por asamblea
+const assemblyMutedUsers = new Map(); // Set de userId/identificador bloqueados por asamblea
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function getMutedSetForAssembly(assemblyId) {
+  const target = parseInt(assemblyId) || 1;
+  if (!assemblyMutedUsers.has(target)) {
+    assemblyMutedUsers.set(target, new Set());
+  }
+  return assemblyMutedUsers.get(target);
+}
 
 // HELPER PARA OBTENER EL TIMESTAMP UNIX REAL DIRECTAMENTE DEL SERVIDOR DE ZOOM
 function getZoomServerUnixTime() {
@@ -835,6 +847,14 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
         timerIntervals.delete(targetAssembly);
       }
       activeQuestions.delete(targetAssembly);
+    }
+
+    assemblyPinnedMessage.delete(targetAssembly);
+    assemblyMutedUsers.delete(targetAssembly);
+    for (let i = memoryChat.length - 1; i >= 0; i--) {
+      if (parseInt(memoryChat[i].assemblyId) === targetAssembly) {
+        memoryChat.splice(i, 1);
+      }
     }
 
     const roomName = `assembly_${targetAssembly}`;
@@ -1981,6 +2001,7 @@ io.on('connection', (socket) => {
 
       socket.assemblyId = targetAssembly;
       socket.userId = userId;
+      socket.identificadorUnico = user.identificador_unico;
 
       const roomName = `assembly_${targetAssembly}`;
       socket.join(roomName);
@@ -1995,10 +2016,19 @@ io.on('connection', (socket) => {
 
       socket.emit('auth:success', { user, room: roomName });
 
-      // ENVIAR HISTORIAL Y ESTADO DEL CHAT AL CONECTAR
+      // ENVIAR HISTORIAL, ESTADO DE PAUSA, MENSAJE ANCLADO Y LISTA DE BLOQUEADOS AL CONECTAR
       const chatHistoryAssembly = memoryChat.filter(m => parseInt(m.assemblyId) === targetAssembly);
       const isPausedNow = assemblyChatActive.get(targetAssembly) === false;
-      socket.emit('chat:history', { messages: chatHistoryAssembly, paused: isPausedNow });
+      const pinnedNow = assemblyPinnedMessage.get(targetAssembly) || null;
+      const mutedSet = getMutedSetForAssembly(targetAssembly);
+      const mutedArray = Array.from(mutedSet);
+
+      socket.emit('chat:history', {
+        messages: chatHistoryAssembly,
+        paused: isPausedNow,
+        pinnedMessage: pinnedNow,
+        mutedUsers: mutedArray
+      });
 
       await updateAndBroadcastQuorum(targetAssembly);
 
@@ -2041,8 +2071,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  // EVENTOS DEL CANAL DE CHAT OFICIAL Y MODERACIÓN
-  socket.on('chat:message', ({ assemblyId, texto, emisor, unidad, esOficial }) => {
+  // EVENTOS DEL CANAL DE CHAT OFICIAL Y MODERACIÓN AVANZADA
+  socket.on('chat:message', ({ assemblyId, texto, emisor, unidad, esOficial, senderId, senderIdentificador }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     const isPaused = assemblyChatActive.get(targetAssembly) === false;
 
@@ -2051,9 +2081,27 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const effectiveUserId = senderId !== undefined ? senderId : (socket.userId || 0);
+    const effectiveIdentificador = (senderIdentificador || socket.identificadorUnico || '').toString().trim().toUpperCase();
+
+    // Verificar si el usuario está bloqueado individualmente en esta asamblea
+    const mutedSet = getMutedSetForAssembly(targetAssembly);
+    if (
+      !esOficial &&
+      (
+        (effectiveUserId && mutedSet.has(String(effectiveUserId))) ||
+        (effectiveIdentificador && mutedSet.has(effectiveIdentificador))
+      )
+    ) {
+      socket.emit('chat:error_muted', { message: 'Has sido silenciado en el chat por el moderador.' });
+      return;
+    }
+
     const msgData = {
-      id: Date.now(),
+      id: Date.now() + Math.floor(Math.random() * 1000),
       assemblyId: targetAssembly,
+      userId: effectiveUserId,
+      identificadorUnico: effectiveIdentificador,
       texto: (texto || '').toString().trim().slice(0, 300),
       emisor: emisor || 'Asistente',
       unidad: unidad || '---',
@@ -2065,12 +2113,14 @@ io.on('connection', (socket) => {
     io.to(`assembly_${targetAssembly}`).emit('chat:broadcast', msgData);
   });
 
+  // Pausar / Reanudar el chat globalmente
   socket.on('admin:toggle_chat', ({ assemblyId, paused }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     assemblyChatActive.set(targetAssembly, !paused);
     io.to(`assembly_${targetAssembly}`).emit('chat:status', { paused: !!paused });
   });
 
+  // Limpiar todo el historial del chat
   socket.on('admin:clear_chat', ({ assemblyId }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     for (let i = memoryChat.length - 1; i >= 0; i--) {
@@ -2078,7 +2128,61 @@ io.on('connection', (socket) => {
         memoryChat.splice(i, 1);
       }
     }
+    assemblyPinnedMessage.delete(targetAssembly);
     io.to(`assembly_${targetAssembly}`).emit('chat:cleared');
+    io.to(`assembly_${targetAssembly}`).emit('chat:pinned_updated', { pinnedMessage: null });
+  });
+
+  // Eliminar un mensaje puntual del chat
+  socket.on('admin:delete_chat_message', ({ assemblyId, messageId }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    const index = memoryChat.findIndex(m => parseInt(m.assemblyId) === targetAssembly && String(m.id) === String(messageId));
+    if (index !== -1) {
+      memoryChat.splice(index, 1);
+    }
+
+    // Si el mensaje eliminado estaba anclado, desanclarlo automáticamente
+    const currentPinned = assemblyPinnedMessage.get(targetAssembly);
+    if (currentPinned && String(currentPinned.id) === String(messageId)) {
+      assemblyPinnedMessage.delete(targetAssembly);
+      io.to(`assembly_${targetAssembly}`).emit('chat:pinned_updated', { pinnedMessage: null });
+    }
+
+    io.to(`assembly_${targetAssembly}`).emit('chat:message_deleted', { messageId });
+  });
+
+  // Anclar o desanclar un mensaje importante al inicio del chat
+  socket.on('admin:pin_chat_message', ({ assemblyId, messageId }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    if (!messageId) {
+      assemblyPinnedMessage.delete(targetAssembly);
+      io.to(`assembly_${targetAssembly}`).emit('chat:pinned_updated', { pinnedMessage: null });
+      return;
+    }
+
+    const foundMsg = memoryChat.find(m => parseInt(m.assemblyId) === targetAssembly && String(m.id) === String(messageId));
+    if (foundMsg) {
+      assemblyPinnedMessage.set(targetAssembly, foundMsg);
+      io.to(`assembly_${targetAssembly}`).emit('chat:pinned_updated', { pinnedMessage: foundMsg });
+    }
+  });
+
+  // Bloquear o desbloquear un usuario para enviar mensajes en el chat
+  socket.on('admin:toggle_mute_user', ({ assemblyId, targetKey, mute }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    if (!targetKey) return;
+    const cleanKey = String(targetKey).trim().toUpperCase();
+    const mutedSet = getMutedSetForAssembly(targetAssembly);
+
+    if (mute) {
+      mutedSet.add(cleanKey);
+    } else {
+      mutedSet.delete(cleanKey);
+    }
+
+    io.to(`assembly_${targetAssembly}`).emit('chat:muted_users_updated', {
+      mutedUsers: Array.from(mutedSet)
+    });
   });
 
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
