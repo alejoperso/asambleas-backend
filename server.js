@@ -235,11 +235,13 @@ async function initDbSchema() {
 }
 initDbSchema();
 
-function generateAlphanumericPassword(length = 8) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-  let password = '';
-  for (let i = 0; i < length; i++) {
-    password += chars.charAt(Math.floor(Math.random() * chars.length));
+// GENERADOR DE CONTRASEÑAS EXCLUSIVAMENTE NUMÉRICAS PARA FACILITAR EL INGRESO DEL USUARIO
+function generateAlphanumericPassword(length = 6) {
+  const firstDigits = '123456789';
+  const allDigits = '0123456789';
+  let password = firstDigits.charAt(Math.floor(Math.random() * firstDigits.length));
+  for (let i = 1; i < length; i++) {
+    password += allDigits.charAt(Math.floor(Math.random() * allDigits.length));
   }
   return password;
 }
@@ -635,7 +637,7 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
   }
 });
 
-// ENVIAR CORREO CON CREDENCIALES AL PERSONAL DE CONTROL
+// ENVIAR CORREO CON CREDENCIALES NUMÉRICAS AL PERSONAL DE CONTROL
 app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
@@ -660,7 +662,7 @@ app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
 
     const plainPassword = (customPassword && customPassword.trim() !== '') 
       ? customPassword.trim() 
-      : generateAlphanumericPassword(8);
+      : generateAlphanumericPassword(6);
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(plainPassword, salt);
@@ -680,7 +682,7 @@ app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
       from: `Plataforma Asambleas <${fromSender}>`,
       to: [user.email],
       subject: `Acceso Panel de Control (${rolNombre}) - ${copropiedadNombre}`,
-      text: `Estimado(a) ${user.nombre_completo}, se te han asignado permisos de ${rolNombre} para ${copropiedadNombre}. URL: ${adminUrl} | Usuario: ${user.email} | Contraseña: ${plainPassword}`,
+      text: `Estimado(a) ${user.nombre_completo}, se te han asignado permisos de ${rolNombre} para ${copropiedadNombre}. URL: ${adminUrl} | Usuario: ${user.email} | Contraseña Numérica: ${plainPassword}`,
       html: `
         <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
           <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a Consola de Control</h2>
@@ -690,7 +692,7 @@ app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
           <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
             <p style="margin: 6px 0; font-size: 14px;"><strong>Enlace de Control:</strong> <a href="${adminUrl}" style="color: #38bdf8; word-break: break-all;">${adminUrl}</a></p>
             <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
-            <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Numérica Asignada:</strong> <span style="background-color: #334155; padding: 3px 10px; border-radius: 4px; font-family: monospace; font-size: 18px; letter-spacing: 2px; font-weight: bold; color: #facc15;">${plainPassword}</span></p>
           </div>
 
           <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
@@ -1073,6 +1075,7 @@ app.put('/api/superadmin/users/:id', async (req, res) => {
   }
 });
 
+// ENVÍO MASIVO DE CREDENCIALES CON CONTRASEÑA NUMÉRICA
 app.post('/api/superadmin/send-credentials', async (req, res) => {
   try {
     const { assemblyId } = req.body;
@@ -1096,7 +1099,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
     let errorCount = 0;
 
     for (const user of usuarios) {
-      const plainPassword = generateAlphanumericPassword(8);
+      const plainPassword = generateAlphanumericPassword(6);
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(plainPassword, salt);
 
@@ -1107,7 +1110,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
           from: `${nombreCopropiedad} <${fromSender}>`,
           to: [user.email],
           subject: `Credenciales de Acceso - ${nombreCopropiedad}`,
-          text: `Estimado(a) ${user.nombre_completo} (${user.unidad}), tus credenciales de acceso para la ${nombreCopropiedad} son: URL: ${clientUrl}?asamblea=${assemblyId} | Usuario: ${user.email} | Contraseña: ${plainPassword}`,
+          text: `Estimado(a) ${user.nombre_completo} (${user.unidad}), tus credenciales de acceso para la ${nombreCopropiedad} son: URL: ${clientUrl}?asamblea=${assemblyId} | Usuario: ${user.email} | Contraseña Numérica: ${plainPassword}`,
           html: `
             <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
               <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a la Asamblea Virtual</h2>
@@ -1117,13 +1120,13 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
               <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
                 <p style="margin: 6px 0; font-size: 14px;"><strong>URL de Ingreso:</strong> <a href="${clientUrl}?asamblea=${assemblyId}" style="color: #38bdf8; word-break: break-all;">${clientUrl}?asamblea=${assemblyId}</a></p>
                 <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
-                <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
+                <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Numérica Asignada:</strong> <span style="background-color: #334155; padding: 3px 10px; border-radius: 4px; font-family: monospace; font-size: 18px; letter-spacing: 2px; font-weight: bold; color: #facc15;">${plainPassword}</span></p>
               </div>
 
               <h3 style="color: #cbd5e1; font-size: 15px; margin-top: 20px;">Instrucciones Básicas de Ingreso:</h3>
               <ol style="font-size: 13px; color: #94a3b8; line-height: 1.8; padding-left: 20px;">
                 <li>Haga clic en el enlace provisto o abra la dirección desde su navegador preferido (Google Chrome o Safari).</li>
-                <li>Ingrese su correo electrónico y la contraseña alfanumérica indicada en este correo.</li>
+                <li>Ingrese su correo electrónico y la contraseña numérica de 6 dígitos indicada en este correo.</li>
                 <li>Mantenga activa su sesión desde un único dispositivo a la vez.</li>
                 <li>Si representa a otros inmuebles mediante poder autorizado, el sistema sumará automáticamente sus coeficientes.</li>
               </ol>
@@ -1162,6 +1165,7 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
   }
 });
 
+// ENVÍO INDIVIDUAL DE CREDENCIAL CON CONTRASEÑA NUMÉRICA
 app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
@@ -1187,7 +1191,7 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
 
     const plainPassword = (customPassword && customPassword.trim() !== '') 
       ? customPassword.trim() 
-      : generateAlphanumericPassword(8);
+      : generateAlphanumericPassword(6);
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(plainPassword, salt);
@@ -1201,7 +1205,7 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
       from: `${user.nombre_copropiedad} <${fromSender}>`,
       to: [user.email],
       subject: `Credenciales de Acceso - ${user.nombre_copropiedad}`,
-      text: `Estimado(a) ${user.nombre_completo} (${user.unidad}), tus credenciales de acceso para la ${user.nombre_copropiedad} son: URL: ${clientUrl}?asamblea=${user.assembly_id} | Usuario: ${user.email} | Contraseña: ${plainPassword}`,
+      text: `Estimado(a) ${user.nombre_completo} (${user.unidad}), tus credenciales de acceso para la ${user.nombre_copropiedad} son: URL: ${clientUrl}?asamblea=${user.assembly_id} | Usuario: ${user.email} | Contraseña Numérica: ${plainPassword}`,
       html: `
         <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
           <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a la Asamblea Virtual</h2>
@@ -1211,13 +1215,13 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
           <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
             <p style="margin: 6px 0; font-size: 14px;"><strong>URL de Ingreso:</strong> <a href="${clientUrl}?asamblea=${user.assembly_id}" style="color: #38bdf8; word-break: break-all;">${clientUrl}?asamblea=${user.assembly_id}</a></p>
             <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
-            <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Asignada:</strong> <span style="background-color: #334155; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 16px; color: #facc15;">${plainPassword}</span></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Numérica Asignada:</strong> <span style="background-color: #334155; padding: 3px 10px; border-radius: 4px; font-family: monospace; font-size: 18px; letter-spacing: 2px; font-weight: bold; color: #facc15;">${plainPassword}</span></p>
           </div>
 
           <h3 style="color: #cbd5e1; font-size: 15px; margin-top: 20px;">Instrucciones Básicas de Ingreso:</h3>
           <ol style="font-size: 13px; color: #94a3b8; line-height: 1.8; padding-left: 20px;">
             <li>Haga clic en el enlace provisto o abra la dirección desde su navegador preferido (Google Chrome o Safari).</li>
-            <li>Ingrese su correo electrónico y la contraseña alfanumérica indicada en este correo.</li>
+            <li>Ingrese su correo electrónico y la contraseña numérica de 6 dígitos indicada en este correo.</li>
             <li>Mantenga activa su sesión desde un único dispositivo a la vez.</li>
             <li>Si representa a otros inmuebles mediante poder autorizado, el sistema sumará automáticamente sus coeficientes.</li>
           </ol>
@@ -2040,7 +2044,6 @@ io.on('connection', (socket) => {
         mutedUsers: mutedArray
       });
 
-      // Si hay un borrador de pregunta redactándose en vivo, enviarlo al usuario recién conectado
       if (assemblyDraftPreview.has(targetAssembly)) {
         socket.emit('question:draft_preview', assemblyDraftPreview.get(targetAssembly));
       }
@@ -2268,7 +2271,7 @@ io.on('connection', (socket) => {
       const targetAssembly = parseInt(assemblyId) || 1;
       if (timerIntervals.has(targetAssembly)) {
         clearInterval(timerIntervals.get(targetAssembly));
-        timerIntervals.delete(targetAssembly);
+        timerIntervals.delete(assemblyId);
       }
       const currentQ = activeQuestions.get(targetAssembly);
       if (currentQ) { currentQ.isOpen = false; activeQuestions.delete(targetAssembly); }
