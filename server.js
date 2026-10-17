@@ -30,11 +30,12 @@ const timerIntervals = new Map();
 const activeSessions = new Map();
 const socketUserMap = new Map();
 
-// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT Y BORRADOR DE PREGUNTA POR ASAMBLEA
+// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS Y BORRADOR DE PREGUNTA POR ASAMBLEA
 const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
 const assemblyPinnedMessage = new Map(); // Mensaje anclado actual por asamblea
 const assemblyMutedUsers = new Map(); // Set de userId/identificador bloqueados por asamblea
 const assemblyDraftPreview = new Map(); // Estado actual de pregunta en redacción por asamblea
+const assemblyRaisedHands = new Map(); // Cola FIFO de manos levantadas por asamblea
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -44,6 +45,14 @@ function getMutedSetForAssembly(assemblyId) {
     assemblyMutedUsers.set(target, new Set());
   }
   return assemblyMutedUsers.get(target);
+}
+
+function getRaisedHandsForAssembly(assemblyId) {
+  const target = parseInt(assemblyId) || 1;
+  if (!assemblyRaisedHands.has(target)) {
+    assemblyRaisedHands.set(target, []);
+  }
+  return assemblyRaisedHands.get(target);
 }
 
 // HELPER PARA OBTENER EL TIMESTAMP UNIX REAL DIRECTAMENTE DEL SERVIDOR DE ZOOM
@@ -802,6 +811,7 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
     }
 
     assemblyDraftPreview.delete(targetAssembly);
+    assemblyRaisedHands.delete(targetAssembly);
 
     const cleanupSteps = [
       { name: 'votos', query: `DELETE FROM votos WHERE assembly_id = ?`, params: [targetAssembly] },
@@ -857,6 +867,7 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
     assemblyPinnedMessage.delete(targetAssembly);
     assemblyMutedUsers.delete(targetAssembly);
     assemblyDraftPreview.delete(targetAssembly);
+    assemblyRaisedHands.delete(targetAssembly);
     for (let i = memoryChat.length - 1; i >= 0; i--) {
       if (parseInt(memoryChat[i].assemblyId) === targetAssembly) {
         memoryChat.splice(i, 1);
@@ -1906,7 +1917,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.1.0-master' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.2.0-master' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -2016,6 +2027,8 @@ io.on('connection', (socket) => {
       socket.assemblyId = targetAssembly;
       socket.userId = userId;
       socket.identificadorUnico = user.identificador_unico;
+      socket.nombreCompleto = user.nombre_completo;
+      socket.unidad = user.unidad;
 
       const roomName = `assembly_${targetAssembly}`;
       socket.join(roomName);
@@ -2030,18 +2043,20 @@ io.on('connection', (socket) => {
 
       socket.emit('auth:success', { user, room: roomName });
 
-      // ENVIAR HISTORIAL, ESTADO DE PAUSA, MENSAJE ANCLADO Y LISTA DE BLOQUEADOS AL CONECTAR
+      // ENVIAR HISTORIAL, ESTADO DE PAUSA, MENSAJE ANCLADO, BLOQUEADOS Y MANOS LEVANTADAS AL CONECTAR
       const chatHistoryAssembly = memoryChat.filter(m => parseInt(m.assemblyId) === targetAssembly);
       const isPausedNow = assemblyChatActive.get(targetAssembly) === false;
       const pinnedNow = assemblyPinnedMessage.get(targetAssembly) || null;
       const mutedSet = getMutedSetForAssembly(targetAssembly);
       const mutedArray = Array.from(mutedSet);
+      const raisedHandsNow = getRaisedHandsForAssembly(targetAssembly);
 
       socket.emit('chat:history', {
         messages: chatHistoryAssembly,
         paused: isPausedNow,
         pinnedMessage: pinnedNow,
-        mutedUsers: mutedArray
+        mutedUsers: mutedArray,
+        raisedHands: raisedHandsNow
       });
 
       if (assemblyDraftPreview.has(targetAssembly)) {
@@ -2107,6 +2122,90 @@ io.on('connection', (socket) => {
 
     assemblyDraftPreview.set(targetAssembly, draftPayload);
     io.to(`assembly_${targetAssembly}`).emit('question:draft_preview', draftPayload);
+  });
+
+  // =========================================================================
+  // COLA ENUMERADA DE LEVANTAR / BAJAR LA MANO (SOLICITUD DE LA PALABRA)
+  // =========================================================================
+  socket.on('chat:toggle_hand', ({ assemblyId, userId, identificadorUnico, nombreCompleto, unidad, raise }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    const effectiveUserId = userId !== undefined ? userId : (socket.userId || 0);
+    const effectiveIdentificador = (identificadorUnico || socket.identificadorUnico || String(effectiveUserId)).toString().trim().toUpperCase();
+    const effectiveNombre = (nombreCompleto || socket.nombreCompleto || 'Asistente').toString().trim();
+    const effectiveUnidad = (unidad || socket.unidad || '---').toString().trim();
+
+    if (!effectiveIdentificador) return;
+
+    const handsQueue = getRaisedHandsForAssembly(targetAssembly);
+    const existingIdx = handsQueue.findIndex(h => h.key === effectiveIdentificador);
+
+    if (raise) {
+      if (existingIdx === -1) {
+        const horaStr = new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        handsQueue.push({
+          key: effectiveIdentificador,
+          userId: effectiveUserId,
+          identificadorUnico: effectiveIdentificador,
+          nombreCompleto: effectiveNombre,
+          unidad: effectiveUnidad,
+          hora: horaStr,
+          timestamp: Date.now()
+        });
+
+        const turnoAsignado = handsQueue.length;
+
+        // Publicar notificación automática destacada en el chat indicando el turno asignado
+        const handMsg = {
+          id: Date.now() + Math.floor(Math.random() * 1000),
+          assemblyId: targetAssembly,
+          userId: effectiveUserId,
+          identificadorUnico: effectiveIdentificador,
+          texto: `✋ Ha levantado la mano para solicitar la palabra (Turno #${turnoAsignado}).`,
+          emisor: effectiveNombre,
+          unidad: effectiveUnidad,
+          esOficial: false,
+          esManoLevantada: true,
+          turnoMano: turnoAsignado,
+          hora: new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit' })
+        };
+        memoryChat.push(handMsg);
+        if (memoryChat.length > 1000) memoryChat.shift();
+        io.to(`assembly_${targetAssembly}`).emit('chat:broadcast', handMsg);
+      }
+    } else {
+      if (existingIdx !== -1) {
+        handsQueue.splice(existingIdx, 1);
+      }
+    }
+
+    io.to(`assembly_${targetAssembly}`).emit('chat:hands_updated', {
+      raisedHands: handsQueue
+    });
+  });
+
+  // Bajar la mano de un participante específico desde admin.html
+  socket.on('admin:lower_hand', ({ assemblyId, targetKey }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    if (!targetKey) return;
+    const cleanKey = String(targetKey).trim().toUpperCase();
+    const handsQueue = getRaisedHandsForAssembly(targetAssembly);
+    const idx = handsQueue.findIndex(h => h.key === cleanKey || String(h.userId).toUpperCase() === cleanKey);
+
+    if (idx !== -1) {
+      handsQueue.splice(idx, 1);
+      io.to(`assembly_${targetAssembly}`).emit('chat:hands_updated', {
+        raisedHands: handsQueue
+      });
+    }
+  });
+
+  // Bajar todas las manos levantadas desde admin.html
+  socket.on('admin:clear_hands', ({ assemblyId }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    assemblyRaisedHands.set(targetAssembly, []);
+    io.to(`assembly_${targetAssembly}`).emit('chat:hands_updated', {
+      raisedHands: []
+    });
   });
 
   // EVENTOS DEL CANAL DE CHAT OFICIAL Y MODERACIÓN AVANZADA
@@ -2271,13 +2370,13 @@ io.on('connection', (socket) => {
       const targetAssembly = parseInt(assemblyId) || 1;
       if (timerIntervals.has(targetAssembly)) {
         clearInterval(timerIntervals.get(targetAssembly));
-        timerIntervals.delete(assemblyId);
+        timerIntervals.delete(targetAssembly);
       }
       const currentQ = activeQuestions.get(targetAssembly);
       if (currentQ) { currentQ.isOpen = false; activeQuestions.delete(targetAssembly); }
 
       await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, targetAssembly]);
-      const finalResults = await calculateWeightedResults(targetAssembly, preguntaId);
+      const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
       const finalStats = await getVotingStats(targetAssembly, preguntaId);
 
       const roomName = `assembly_${targetAssembly}`;
@@ -2362,4 +2461,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.1.0-master corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.2.0-master corriendo en puerto ${PORT}`));
