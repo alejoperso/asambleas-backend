@@ -30,10 +30,11 @@ const timerIntervals = new Map();
 const activeSessions = new Map();
 const socketUserMap = new Map();
 
-// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT POR ASAMBLEA
+// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT Y BORRADOR DE PREGUNTA POR ASAMBLEA
 const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
 const assemblyPinnedMessage = new Map(); // Mensaje anclado actual por asamblea
 const assemblyMutedUsers = new Map(); // Set de userId/identificador bloqueados por asamblea
+const assemblyDraftPreview = new Map(); // Estado actual de pregunta en redacción por asamblea
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -798,6 +799,8 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
       activeQuestions.delete(targetAssembly);
     }
 
+    assemblyDraftPreview.delete(targetAssembly);
+
     const cleanupSteps = [
       { name: 'votos', query: `DELETE FROM votos WHERE assembly_id = ?`, params: [targetAssembly] },
       { name: 'opciones_pregunta', query: `DELETE FROM opciones_pregunta WHERE pregunta_id IN (SELECT id FROM preguntas WHERE assembly_id = ?)`, params: [targetAssembly] },
@@ -851,6 +854,7 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
 
     assemblyPinnedMessage.delete(targetAssembly);
     assemblyMutedUsers.delete(targetAssembly);
+    assemblyDraftPreview.delete(targetAssembly);
     for (let i = memoryChat.length - 1; i >= 0; i--) {
       if (parseInt(memoryChat[i].assemblyId) === targetAssembly) {
         memoryChat.splice(i, 1);
@@ -1366,15 +1370,18 @@ app.get('/api/questions/detail/:id', async (req, res) => {
 app.post('/api/questions', async (req, res) => {
   try {
     const { assemblyId, textoPregunta, duracionSegundos, opciones } = req.body;
+    const targetAssembly = parseInt(assemblyId) || 1;
     const [result] = await db.query(
       `INSERT INTO preguntas (assembly_id, texto_pregunta, duracion_segundos, estado) VALUES (?, ?, ?, 'borrador')`,
-      [assemblyId || 1, textoPregunta, parseInt(duracionSegundos) || 60]
+      [targetAssembly, textoPregunta, parseInt(duracionSegundos) || 60]
     );
     const preguntaId = result.insertId;
     for (let i = 0; i < opciones.length; i++) {
       await db.query(`INSERT INTO opciones_pregunta (pregunta_id, texto_opcion, orden) VALUES (?, ?, ?)`, [preguntaId, opciones[i], i + 1]);
     }
-    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
+    assemblyDraftPreview.delete(targetAssembly);
+    io.to(`assembly_${targetAssembly}`).emit('question:draft_preview', { isTyping: false });
+    io.to(`assembly_${targetAssembly}`).emit('questions:updated');
     res.json({ ok: true, preguntaId });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1385,6 +1392,7 @@ app.put('/api/questions/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { textoPregunta, duracionSegundos, opciones, assemblyId } = req.body;
+    const targetAssembly = parseInt(assemblyId) || 1;
     await db.query(`UPDATE preguntas SET texto_pregunta = ?, duracion_segundos = ? WHERE id = ?`, [textoPregunta, parseInt(duracionSegundos) || 60, id]);
     
     if (opciones && opciones.length >= 2) {
@@ -1393,7 +1401,9 @@ app.put('/api/questions/:id', async (req, res) => {
         await db.query(`INSERT INTO opciones_pregunta (pregunta_id, texto_opcion, orden) VALUES (?, ?, ?)`, [id, opciones[i], i + 1]);
       }
     }
-    io.to(`assembly_${assemblyId || 1}`).emit('questions:updated');
+    assemblyDraftPreview.delete(targetAssembly);
+    io.to(`assembly_${targetAssembly}`).emit('question:draft_preview', { isTyping: false });
+    io.to(`assembly_${targetAssembly}`).emit('questions:updated');
     res.json({ ok: true, message: 'Pregunta actualizada exitosamente.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1409,7 +1419,7 @@ app.delete('/api/questions/:id', async (req, res) => {
     await db.query(`DELETE FROM opciones_pregunta WHERE pregunta_id = ?`, [id]);
     await db.query(`DELETE FROM preguntas WHERE id = ?`, [id]);
 
-    const targetAssembly = assemblyId || 1;
+    const targetAssembly = parseInt(assemblyId) || 1;
     io.to(`assembly_${targetAssembly}`).emit('questions:updated');
     res.json({ ok: true, message: 'Pregunta y sus votos fueron eliminados correctamente.' });
   } catch (err) {
@@ -2030,6 +2040,11 @@ io.on('connection', (socket) => {
         mutedUsers: mutedArray
       });
 
+      // Si hay un borrador de pregunta redactándose en vivo, enviarlo al usuario recién conectado
+      if (assemblyDraftPreview.has(targetAssembly)) {
+        socket.emit('question:draft_preview', assemblyDraftPreview.get(targetAssembly));
+      }
+
       await updateAndBroadcastQuorum(targetAssembly);
 
       if (activeQuestions.has(targetAssembly)) {
@@ -2071,12 +2086,31 @@ io.on('connection', (socket) => {
     }
   });
 
+  // TRANSMISIÓN EN TIEMPO REAL DE LA PREGUNTA QUE SE ESTÁ REDACTANDO EN EL MODAL DE ADMIN
+  socket.on('admin:typing_question', ({ assemblyId, isTyping, textoPregunta, duracionSegundos, opciones }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    if (!isTyping || !textoPregunta || textoPregunta.toString().trim() === '') {
+      assemblyDraftPreview.delete(targetAssembly);
+      io.to(`assembly_${targetAssembly}`).emit('question:draft_preview', { isTyping: false });
+      return;
+    }
+
+    const draftPayload = {
+      isTyping: true,
+      textoPregunta: textoPregunta.toString().trim(),
+      duracionSegundos: parseInt(duracionSegundos) || 60,
+      opciones: Array.isArray(opciones) ? opciones : []
+    };
+
+    assemblyDraftPreview.set(targetAssembly, draftPayload);
+    io.to(`assembly_${targetAssembly}`).emit('question:draft_preview', draftPayload);
+  });
+
   // EVENTOS DEL CANAL DE CHAT OFICIAL Y MODERACIÓN AVANZADA
   socket.on('chat:message', ({ assemblyId, texto, emisor, unidad, esOficial, senderId, senderIdentificador }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     const isPaused = assemblyChatActive.get(targetAssembly) === false;
 
-    // Si el chat está pausado por el moderador, solo permitir comunicados oficiales
     if (isPaused && !esOficial) {
       return;
     }
@@ -2084,7 +2118,6 @@ io.on('connection', (socket) => {
     const effectiveUserId = senderId !== undefined ? senderId : (socket.userId || 0);
     const effectiveIdentificador = (senderIdentificador || socket.identificadorUnico || '').toString().trim().toUpperCase();
 
-    // Verificar si el usuario está bloqueado individualmente en esta asamblea
     const mutedSet = getMutedSetForAssembly(targetAssembly);
     if (
       !esOficial &&
@@ -2109,18 +2142,16 @@ io.on('connection', (socket) => {
       hora: new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit' })
     };
     memoryChat.push(msgData);
-    if (memoryChat.length > 100) memoryChat.shift();
+    if (memoryChat.length > 1000) memoryChat.shift();
     io.to(`assembly_${targetAssembly}`).emit('chat:broadcast', msgData);
   });
 
-  // Pausar / Reanudar el chat globalmente
   socket.on('admin:toggle_chat', ({ assemblyId, paused }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     assemblyChatActive.set(targetAssembly, !paused);
     io.to(`assembly_${targetAssembly}`).emit('chat:status', { paused: !!paused });
   });
 
-  // Limpiar todo el historial del chat
   socket.on('admin:clear_chat', ({ assemblyId }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     for (let i = memoryChat.length - 1; i >= 0; i--) {
@@ -2133,7 +2164,6 @@ io.on('connection', (socket) => {
     io.to(`assembly_${targetAssembly}`).emit('chat:pinned_updated', { pinnedMessage: null });
   });
 
-  // Eliminar un mensaje puntual del chat
   socket.on('admin:delete_chat_message', ({ assemblyId, messageId }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     const index = memoryChat.findIndex(m => parseInt(m.assemblyId) === targetAssembly && String(m.id) === String(messageId));
@@ -2141,7 +2171,6 @@ io.on('connection', (socket) => {
       memoryChat.splice(index, 1);
     }
 
-    // Si el mensaje eliminado estaba anclado, desanclarlo automáticamente
     const currentPinned = assemblyPinnedMessage.get(targetAssembly);
     if (currentPinned && String(currentPinned.id) === String(messageId)) {
       assemblyPinnedMessage.delete(targetAssembly);
@@ -2151,7 +2180,6 @@ io.on('connection', (socket) => {
     io.to(`assembly_${targetAssembly}`).emit('chat:message_deleted', { messageId });
   });
 
-  // Anclar o desanclar un mensaje importante al inicio del chat
   socket.on('admin:pin_chat_message', ({ assemblyId, messageId }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     if (!messageId) {
@@ -2167,7 +2195,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Bloquear o desbloquear un usuario para enviar mensajes en el chat
   socket.on('admin:toggle_mute_user', ({ assemblyId, targetKey, mute }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     if (!targetKey) return;
@@ -2187,26 +2214,29 @@ io.on('connection', (socket) => {
 
   socket.on('admin:start_voting', async ({ assemblyId, preguntaId, duracionSegundos }) => {
     try {
-      if (timerIntervals.has(assemblyId)) clearInterval(timerIntervals.get(assemblyId));
-      await db.query(`UPDATE preguntas SET estado = 'activa' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
+      const targetAssembly = parseInt(assemblyId) || 1;
+      if (timerIntervals.has(targetAssembly)) clearInterval(timerIntervals.get(targetAssembly));
+      await db.query(`UPDATE preguntas SET estado = 'activa' WHERE id = ? AND assembly_id = ?`, [preguntaId, targetAssembly]);
 
       const [preguntas] = await db.query(`SELECT id, texto_pregunta FROM preguntas WHERE id = ?`, [preguntaId]);
       const [opciones] = await db.query(`SELECT id, texto_opcion FROM opciones_pregunta WHERE pregunta_id = ? ORDER BY orden ASC`, [preguntaId]);
       if (preguntas.length === 0) return;
 
       const duracion = parseInt(duracionSegundos) || 60;
-      const stats = await getVotingStats(assemblyId, preguntaId);
-      const resultados = await calculateWeightedResults(assemblyId, preguntaId);
+      const stats = await getVotingStats(targetAssembly, preguntaId);
+      const resultados = await calculateWeightedResults(targetAssembly, preguntaId);
       const activeQData = { id: preguntas[0].id, texto: preguntas[0].texto_pregunta, opciones, duracion, tiempoRestante: duracion, isOpen: true, stats, resultados };
 
-      activeQuestions.set(assemblyId, activeQData);
-      const roomName = `assembly_${assemblyId}`;
+      activeQuestions.set(targetAssembly, activeQData);
+      assemblyDraftPreview.delete(targetAssembly);
+      const roomName = `assembly_${targetAssembly}`;
 
+      io.to(roomName).emit('question:draft_preview', { isTyping: false });
       io.to(roomName).emit('voting:started', activeQData);
       io.to(roomName).emit('questions:updated');
 
       const interval = setInterval(async () => {
-        const currentQ = activeQuestions.get(assemblyId);
+        const currentQ = activeQuestions.get(targetAssembly);
         if (!currentQ) { clearInterval(interval); return; }
 
         currentQ.tiempoRestante -= 1;
@@ -2214,20 +2244,20 @@ io.on('connection', (socket) => {
 
         if (currentQ.tiempoRestante <= 0) {
           clearInterval(interval);
-          timerIntervals.delete(assemblyId);
+          timerIntervals.delete(targetAssembly);
           currentQ.isOpen = false;
 
           await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ?`, [preguntaId]);
-          const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
-          const finalStats = await getVotingStats(assemblyId, preguntaId);
+          const finalResults = await calculateWeightedResults(targetAssembly, preguntaId);
+          const finalStats = await getVotingStats(targetAssembly, preguntaId);
 
           io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults, stats: finalStats });
           io.to(roomName).emit('questions:updated');
-          activeQuestions.delete(assemblyId);
+          activeQuestions.delete(targetAssembly);
         }
       }, 1000);
 
-      timerIntervals.set(assemblyId, interval);
+      timerIntervals.set(targetAssembly, interval);
     } catch (error) {
       console.error('Error al iniciar votación:', error);
     }
@@ -2235,18 +2265,19 @@ io.on('connection', (socket) => {
 
   socket.on('admin:stop_voting', async ({ assemblyId, preguntaId }) => {
     try {
-      if (timerIntervals.has(assemblyId)) {
-        clearInterval(timerIntervals.get(assemblyId));
-        timerIntervals.delete(assemblyId);
+      const targetAssembly = parseInt(assemblyId) || 1;
+      if (timerIntervals.has(targetAssembly)) {
+        clearInterval(timerIntervals.get(targetAssembly));
+        timerIntervals.delete(targetAssembly);
       }
-      const currentQ = activeQuestions.get(assemblyId);
-      if (currentQ) { currentQ.isOpen = false; activeQuestions.delete(assemblyId); }
+      const currentQ = activeQuestions.get(targetAssembly);
+      if (currentQ) { currentQ.isOpen = false; activeQuestions.delete(targetAssembly); }
 
-      await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, assemblyId]);
-      const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
-      const finalStats = await getVotingStats(assemblyId, preguntaId);
+      await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, targetAssembly]);
+      const finalResults = await calculateWeightedResults(targetAssembly, preguntaId);
+      const finalStats = await getVotingStats(targetAssembly, preguntaId);
 
-      const roomName = `assembly_${assemblyId}`;
+      const roomName = `assembly_${targetAssembly}`;
       io.to(roomName).emit('voting:closed', { preguntaId, resultados: finalResults, stats: finalStats });
       io.to(roomName).emit('questions:updated');
     } catch (error) {
