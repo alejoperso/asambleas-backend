@@ -35,7 +35,7 @@ const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
 const assemblyPinnedMessage = new Map(); // Mensaje anclado actual por asamblea
 const assemblyMutedUsers = new Map(); // Set de userId/identificador bloqueados por asamblea
 const assemblyDraftPreview = new Map(); // Estado actual de pregunta en redacción por asamblea
-const assemblyRaisedHands = new Map(); // Cola FIFO de manos levantadas por asamblea
+const assemblyRaisedHands = new Map(); // Cola FIFO en vivo de manos levantadas por asamblea
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -1917,7 +1917,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.2.0-master' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.2.1-clean-hands' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -2043,8 +2043,8 @@ io.on('connection', (socket) => {
 
       socket.emit('auth:success', { user, room: roomName });
 
-      // ENVIAR HISTORIAL, ESTADO DE PAUSA, MENSAJE ANCLADO, BLOQUEADOS Y MANOS LEVANTADAS AL CONECTAR
-      const chatHistoryAssembly = memoryChat.filter(m => parseInt(m.assemblyId) === targetAssembly);
+      // Filtrar cualquier mensaje viejo de mano levantada para mantener el historial 100% limpio
+      const chatHistoryAssembly = memoryChat.filter(m => parseInt(m.assemblyId) === targetAssembly && !m.esManoLevantada);
       const isPausedNow = assemblyChatActive.get(targetAssembly) === false;
       const pinnedNow = assemblyPinnedMessage.get(targetAssembly) || null;
       const mutedSet = getMutedSetForAssembly(targetAssembly);
@@ -2125,7 +2125,7 @@ io.on('connection', (socket) => {
   });
 
   // =========================================================================
-  // COLA ENUMERADA DE LEVANTAR / BAJAR LA MANO (SOLICITUD DE LA PALABRA)
+  // COLA ENUMERADA DE LEVANTAR / BAJAR LA MANO (100% EN VIVO, SIN ENSUCIAR EL CHAT)
   // =========================================================================
   socket.on('chat:toggle_hand', ({ assemblyId, userId, identificadorUnico, nombreCompleto, unidad, raise }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
@@ -2141,7 +2141,7 @@ io.on('connection', (socket) => {
 
     if (raise) {
       if (existingIdx === -1) {
-        const horaStr = new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const horaStr = new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit' });
         handsQueue.push({
           key: effectiveIdentificador,
           userId: effectiveUserId,
@@ -2151,26 +2151,6 @@ io.on('connection', (socket) => {
           hora: horaStr,
           timestamp: Date.now()
         });
-
-        const turnoAsignado = handsQueue.length;
-
-        // Publicar notificación automática destacada en el chat indicando el turno asignado
-        const handMsg = {
-          id: Date.now() + Math.floor(Math.random() * 1000),
-          assemblyId: targetAssembly,
-          userId: effectiveUserId,
-          identificadorUnico: effectiveIdentificador,
-          texto: `✋ Ha levantado la mano para solicitar la palabra (Turno #${turnoAsignado}).`,
-          emisor: effectiveNombre,
-          unidad: effectiveUnidad,
-          esOficial: false,
-          esManoLevantada: true,
-          turnoMano: turnoAsignado,
-          hora: new Date().toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit' })
-        };
-        memoryChat.push(handMsg);
-        if (memoryChat.length > 1000) memoryChat.shift();
-        io.to(`assembly_${targetAssembly}`).emit('chat:broadcast', handMsg);
       }
     } else {
       if (existingIdx !== -1) {
@@ -2338,7 +2318,7 @@ io.on('connection', (socket) => {
       io.to(roomName).emit('questions:updated');
 
       const interval = setInterval(async () => {
-        const currentQ = activeQuestions.get(targetAssembly);
+        const currentQ = activeQuestions.get(assemblyId);
         if (!currentQ) { clearInterval(interval); return; }
 
         currentQ.tiempoRestante -= 1;
@@ -2376,7 +2356,7 @@ io.on('connection', (socket) => {
       if (currentQ) { currentQ.isOpen = false; activeQuestions.delete(targetAssembly); }
 
       await db.query(`UPDATE preguntas SET estado = 'cerrada' WHERE id = ? AND assembly_id = ?`, [preguntaId, targetAssembly]);
-      const finalResults = await calculateWeightedResults(assemblyId, preguntaId);
+      const finalResults = await calculateWeightedResults(targetAssembly, preguntaId);
       const finalStats = await getVotingStats(targetAssembly, preguntaId);
 
       const roomName = `assembly_${targetAssembly}`;
@@ -2461,4 +2441,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.2.0-master corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.2.1-clean-hands corriendo en puerto ${PORT}`));
