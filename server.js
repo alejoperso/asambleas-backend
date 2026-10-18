@@ -76,6 +76,76 @@ function getZoomServerUnixTime() {
   });
 }
 
+// HELPER PARA OBTENER TOKEN OAUTH Y ZAK TOKEN DE ANFITRIÓN (PARA INICIAR ZOOM DESDE EL NAVEGADOR SIN APP)
+async function getZoomHostZakToken() {
+  const accountId = (process.env.ZOOM_ACCOUNT_ID || '').trim();
+  const clientId = (process.env.ZOOM_CLIENT_ID || '').trim();
+  const clientSecret = (process.env.ZOOM_CLIENT_SECRET || '').trim();
+
+  if (!accountId || !clientId || !clientSecret) {
+    return null;
+  }
+
+  try {
+    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    const tokenData = await new Promise((resolve, reject) => {
+      const req = https.request(
+        `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${encodeURIComponent(accountId)}`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${basicAuth}`,
+            'Content-Length': 0
+          },
+          timeout: 5000
+        },
+        (res) => {
+          let body = '';
+          res.on('data', chunk => body += chunk);
+          res.on('end', () => {
+            try { resolve(JSON.parse(body)); } catch (e) { resolve({}); }
+          });
+        }
+      );
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout OAuth Zoom')); });
+      req.end();
+    });
+
+    if (!tokenData || !tokenData.access_token) {
+      return null;
+    }
+
+    const zakData = await new Promise((resolve, reject) => {
+      const req = https.request(
+        'https://api.zoom.us/v2/users/me/token?type=zak',
+        {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${tokenData.access_token}`
+          },
+          timeout: 5000
+        },
+        (res) => {
+          let body = '';
+          res.on('data', chunk => body += chunk);
+          res.on('end', () => {
+            try { resolve(JSON.parse(body)); } catch (e) { resolve({}); }
+          });
+        }
+      );
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout ZAK Zoom')); });
+      req.end();
+    });
+
+    return zakData && zakData.token ? zakData.token : null;
+  } catch (err) {
+    console.warn('Aviso obteniendo ZAK Token de Zoom:', err.message);
+    return null;
+  }
+}
+
 // HELPER PARA GENERAR TOKENS SEGUROS DE ACCIÓN EN PODERES
 function generatePowerActionToken(powerId, action) {
   return crypto
@@ -1854,7 +1924,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM CON CREDENCIALES ACTUALIZADAS
+// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM (SOPORTA ROLE 1 ANFITRIÓN + ZAK TOKEN PARA INICIAR SIN ABRIR LA APP DE ZOOM)
 app.post('/api/zoom/signature', async (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
@@ -1863,6 +1933,8 @@ app.post('/api/zoom/signature', async (req, res) => {
 
     const cleanMn = parseInt((meetingNumber || '').toString().replace(/\D/g, ''), 10);
     if (!cleanMn || isNaN(cleanMn)) return res.status(400).json({ ok: false, error: 'ID Zoom Inválido.' });
+
+    const requestedRole = parseInt(role || 0, 10) === 1 ? 1 : 0;
 
     const zoomNow = await getZoomServerUnixTime();
     const iat = zoomNow - 30;
@@ -1873,7 +1945,7 @@ app.post('/api/zoom/signature', async (req, res) => {
       sdkKey,
       appKey: sdkKey,
       mn: cleanMn,
-      role: parseInt(role || 0, 10),
+      role: requestedRole,
       iat,
       exp,
       tokenExp: exp
@@ -1885,7 +1957,13 @@ app.post('/api/zoom/signature', async (req, res) => {
     const hmac = crypto.createHmac('sha256', sdkSecret).update(dataToSign).digest();
     const signature = toBase64Url(hmac);
 
-    res.json({ ok: true, signature: `${dataToSign}.${signature}`, sdkKey });
+    // Si es el moderador/admin (role === 1), intentar obtener el ZAK token de anfitrión por si están configuradas las credenciales S2S OAuth
+    let zakToken = null;
+    if (requestedRole === 1) {
+      zakToken = await getZoomHostZakToken();
+    }
+
+    res.json({ ok: true, signature: `${dataToSign}.${signature}`, sdkKey, zakToken, role: requestedRole });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1917,7 +1995,7 @@ app.put('/api/assemblies/:id/zoom', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.2.1-clean-hands' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.3.0-host-start' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -2043,7 +2121,6 @@ io.on('connection', (socket) => {
 
       socket.emit('auth:success', { user, room: roomName });
 
-      // Filtrar cualquier mensaje viejo de mano levantada para mantener el historial 100% limpio
       const chatHistoryAssembly = memoryChat.filter(m => parseInt(m.assemblyId) === targetAssembly && !m.esManoLevantada);
       const isPausedNow = assemblyChatActive.get(targetAssembly) === false;
       const pinnedNow = assemblyPinnedMessage.get(targetAssembly) || null;
@@ -2104,7 +2181,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // TRANSMISIÓN EN TIEMPO REAL DE LA PREGUNTA QUE SE ESTÁ REDACTANDO EN EL MODAL DE ADMIN
+  // Notificar a todos los asistentes cuando el moderador inicia la sala de Zoom desde admin.html
+  socket.on('admin:zoom_host_started', ({ assemblyId }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    io.to(`assembly_${targetAssembly}`).emit('assembly:started', {
+      message: '¡La sala de video de la Asamblea ha sido iniciada por el moderador!'
+    });
+  });
+
   socket.on('admin:typing_question', ({ assemblyId, isTyping, textoPregunta, duracionSegundos, opciones }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     if (!isTyping || !textoPregunta || textoPregunta.toString().trim() === '') {
@@ -2124,9 +2208,7 @@ io.on('connection', (socket) => {
     io.to(`assembly_${targetAssembly}`).emit('question:draft_preview', draftPayload);
   });
 
-  // =========================================================================
   // COLA ENUMERADA DE LEVANTAR / BAJAR LA MANO (100% EN VIVO, SIN ENSUCIAR EL CHAT)
-  // =========================================================================
   socket.on('chat:toggle_hand', ({ assemblyId, userId, identificadorUnico, nombreCompleto, unidad, raise }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     const effectiveUserId = userId !== undefined ? userId : (socket.userId || 0);
@@ -2163,7 +2245,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Bajar la mano de un participante específico desde admin.html
   socket.on('admin:lower_hand', ({ assemblyId, targetKey }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     if (!targetKey) return;
@@ -2179,7 +2260,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Bajar todas las manos levantadas desde admin.html
   socket.on('admin:clear_hands', ({ assemblyId }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     assemblyRaisedHands.set(targetAssembly, []);
@@ -2188,7 +2268,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // EVENTOS DEL CANAL DE CHAT OFICIAL Y MODERACIÓN AVANZADA
   socket.on('chat:message', ({ assemblyId, texto, emisor, unidad, esOficial, senderId, senderIdentificador }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     const isPaused = assemblyChatActive.get(targetAssembly) === false;
@@ -2318,7 +2397,7 @@ io.on('connection', (socket) => {
       io.to(roomName).emit('questions:updated');
 
       const interval = setInterval(async () => {
-        const currentQ = activeQuestions.get(assemblyId);
+        const currentQ = activeQuestions.get(targetAssembly);
         if (!currentQ) { clearInterval(interval); return; }
 
         currentQ.tiempoRestante -= 1;
@@ -2441,4 +2520,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.2.1-clean-hands corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.3.0-host-start corriendo en puerto ${PORT}`));
