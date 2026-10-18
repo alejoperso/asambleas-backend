@@ -30,12 +30,13 @@ const timerIntervals = new Map();
 const activeSessions = new Map();
 const socketUserMap = new Map();
 
-// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS Y BORRADOR DE PREGUNTA POR ASAMBLEA
+// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS, COMPUERTA ZOOM Y BORRADOR
 const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
 const assemblyPinnedMessage = new Map(); // Mensaje anclado actual por asamblea
 const assemblyMutedUsers = new Map(); // Set de userId/identificador bloqueados por asamblea
 const assemblyDraftPreview = new Map(); // Estado actual de pregunta en redacción por asamblea
 const assemblyRaisedHands = new Map(); // Cola FIFO en vivo de manos levantadas por asamblea
+const assemblyZoomOpen = new Map(); // Compuerta para habilitar/ocultar el acceso a Zoom a los asistentes
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -53,6 +54,11 @@ function getRaisedHandsForAssembly(assemblyId) {
     assemblyRaisedHands.set(target, []);
   }
   return assemblyRaisedHands.get(target);
+}
+
+function isZoomGateOpenForAssembly(assemblyId) {
+  const target = parseInt(assemblyId) || 1;
+  return assemblyZoomOpen.get(target) === true;
 }
 
 // HELPER PARA OBTENER EL TIMESTAMP UNIX REAL DIRECTAMENTE DEL SERVIDOR DE ZOOM
@@ -76,7 +82,7 @@ function getZoomServerUnixTime() {
   });
 }
 
-// HELPER PARA OBTENER TOKEN OAUTH Y ZAK TOKEN DE ANFITRIÓN (PARA INICIAR ZOOM DESDE EL NAVEGADOR SIN APP)
+// HELPER PARA OBTENER TOKEN OAUTH Y ZAK TOKEN DE ANFITRIÓN
 async function getZoomHostZakToken() {
   const accountId = (process.env.ZOOM_ACCOUNT_ID || '').trim();
   const clientId = (process.env.ZOOM_CLIENT_ID || '').trim();
@@ -198,6 +204,7 @@ async function initDbSchema() {
         zoom_meeting_id VARCHAR(100) NULL,
         zoom_passcode VARCHAR(100) NULL,
         zoom_password VARCHAR(100) NULL,
+        zoom_habilitado TINYINT(1) DEFAULT 0,
         fecha_evento DATE NULL,
         hora_inicio DATETIME NULL,
         hora_cierre DATETIME NULL,
@@ -298,6 +305,7 @@ async function initDbSchema() {
       `ALTER TABLE asambleas MODIFY COLUMN logo_url LONGTEXT NULL`,
       `ALTER TABLE asambleas MODIFY COLUMN estado VARCHAR(50) DEFAULT 'programada'`,
       `ALTER TABLE asambleas MODIFY COLUMN zoom_embed_url LONGTEXT NULL`,
+      `ALTER TABLE asambleas ADD COLUMN zoom_habilitado TINYINT(1) DEFAULT 0`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
@@ -307,6 +315,15 @@ async function initDbSchema() {
         await db.query(q);
       } catch (e) {}
     }
+
+    // Sincronizar en memoria el estado inicial de la compuerta de Zoom desde la BD
+    try {
+      const [asmRows] = await db.query(`SELECT id, zoom_habilitado FROM asambleas`);
+      asmRows.forEach(r => {
+        assemblyZoomOpen.set(parseInt(r.id), r.zoom_habilitado === 1);
+      });
+    } catch (e) {}
+
     console.log('✅ Verificación y migración completa de las 7 tablas de base de datos.');
   } catch (err) {
     console.warn('Advertencia en verificación de esquema:', err.message);
@@ -343,6 +360,27 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
   const meetingId = meetingIdMatch ? meetingIdMatch[1] : url.replace(/\D/g, '');
   const passcode = (manualPasscode || '').trim();
   return { meetingId, passcode };
+}
+
+async function getAssemblyZoomStreamInfo(assemblyId) {
+  const target = parseInt(assemblyId) || 1;
+  try {
+    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_habilitado FROM asambleas WHERE id = ?`, [target]);
+    if (rows.length === 0) {
+      return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: false };
+    }
+    const parsed = parseZoomCredentials(rows[0].zoom_embed_url, rows[0].zoom_passcode);
+    const isEnabled = assemblyZoomOpen.has(target) ? assemblyZoomOpen.get(target) : (rows[0].zoom_habilitado === 1);
+    assemblyZoomOpen.set(target, !!isEnabled);
+    return {
+      rawUrl: rows[0].zoom_embed_url || '',
+      meetingId: rows[0].zoom_meeting_id || parsed.meetingId,
+      passcode: rows[0].zoom_passcode || parsed.passcode,
+      zoomHabilitado: !!isEnabled
+    };
+  } catch (err) {
+    return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: isZoomGateOpenForAssembly(target) };
+  }
 }
 
 async function checkUserRepresentedStatus(userId, assemblyId) {
@@ -824,21 +862,25 @@ app.get(['/api/assemblies', '/api/assemblies/active'], async (req, res) => {
 app.post('/api/assemblies/:id/start', async (req, res) => {
   try {
     const { id } = req.params;
+    const targetAssembly = parseInt(id) || 1;
     const now = new Date();
+    assemblyZoomOpen.set(targetAssembly, true);
     try {
-      await db.query(`UPDATE asambleas SET estado = 'en_curso', hora_inicio = NOW() WHERE id = ?`, [id]);
+      await db.query(`UPDATE asambleas SET estado = 'en_curso', zoom_habilitado = 1, hora_inicio = NOW() WHERE id = ?`, [targetAssembly]);
     } catch (e) {
-      await db.query(`UPDATE asambleas SET estado = 'en_curso' WHERE id = ?`, [id]);
+      await db.query(`UPDATE asambleas SET estado = 'en_curso' WHERE id = ?`, [targetAssembly]);
     }
 
-    const roomName = `assembly_${id}`;
+    const streamInfo = await getAssemblyZoomStreamInfo(targetAssembly);
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('zoom:updated', { streamInfo });
     io.to(roomName).emit('assembly:started', {
       message: '¡La Asamblea ha iniciado oficialmente!',
       horaInicio: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
     });
     io.emit('assemblies:updated');
 
-    res.json({ ok: true, message: 'Asamblea iniciada oficialmente.', horaInicio: now });
+    res.json({ ok: true, message: 'Asamblea iniciada oficialmente y sala de Zoom abierta.', horaInicio: now, streamInfo });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -847,14 +889,18 @@ app.post('/api/assemblies/:id/start', async (req, res) => {
 app.post('/api/assemblies/:id/close', async (req, res) => {
   try {
     const { id } = req.params;
+    const targetAssembly = parseInt(id) || 1;
     const now = new Date();
+    assemblyZoomOpen.set(targetAssembly, false);
     try {
-      await db.query(`UPDATE asambleas SET estado = 'finalizada', hora_cierre = NOW() WHERE id = ?`, [id]);
+      await db.query(`UPDATE asambleas SET estado = 'finalizada', zoom_habilitado = 0, hora_cierre = NOW() WHERE id = ?`, [targetAssembly]);
     } catch (e) {
-      await db.query(`UPDATE asambleas SET estado = 'finalizada' WHERE id = ?`, [id]);
+      await db.query(`UPDATE asambleas SET estado = 'finalizada' WHERE id = ?`, [targetAssembly]);
     }
 
-    const roomName = `assembly_${id}`;
+    const streamInfo = await getAssemblyZoomStreamInfo(targetAssembly);
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('zoom:updated', { streamInfo });
     io.to(roomName).emit('assembly:closed', {
       message: 'La Asamblea ha sido cerrada de manera oficial.',
       horaCierre: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -882,6 +928,7 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
 
     assemblyDraftPreview.delete(targetAssembly);
     assemblyRaisedHands.delete(targetAssembly);
+    assemblyZoomOpen.delete(targetAssembly);
 
     const cleanupSteps = [
       { name: 'votos', query: `DELETE FROM votos WHERE assembly_id = ?`, params: [targetAssembly] },
@@ -920,8 +967,9 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
     await db.query(`DELETE FROM votos WHERE assembly_id = ?`, [targetAssembly]);
     await db.query(`UPDATE preguntas SET estado = 'borrador' WHERE assembly_id = ?`, [targetAssembly]);
 
+    assemblyZoomOpen.set(targetAssembly, false);
     try {
-      await db.query(`UPDATE asambleas SET estado = 'programada', hora_inicio = NULL, hora_cierre = NULL WHERE id = ?`, [targetAssembly]);
+      await db.query(`UPDATE asambleas SET estado = 'programada', zoom_habilitado = 0, hora_inicio = NULL, hora_cierre = NULL WHERE id = ?`, [targetAssembly]);
     } catch (e) {
       await db.query(`UPDATE asambleas SET estado = 'programada' WHERE id = ?`, [targetAssembly]);
     }
@@ -949,7 +997,7 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
     io.to(roomName).emit('questions:updated');
     io.emit('assemblies:updated');
 
-    res.json({ ok: true, message: 'Asamblea depurada exitosamente. Se borraron los votos y las preguntas volvieron a estado inicial.' });
+    res.json({ ok: true, message: 'Asamblea depurada exitosamente. Se borraron los votos, se cerró la compuerta de Zoom y las preguntas volvieron a estado inicial.' });
   } catch (err) {
     console.error('Error al depurar asamblea:', err);
     res.status(500).json({ ok: false, error: err.message });
@@ -1035,11 +1083,12 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
 
     const [result] = await db.query(
-      `INSERT INTO asambleas (nombre_copropiedad, logo_url, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password) 
-       VALUES (?, ?, 'programada', ?, ?, ?, ?)`,
+      `INSERT INTO asambleas (nombre_copropiedad, logo_url, estado, zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_password, zoom_habilitado) 
+       VALUES (?, ?, 'programada', ?, ?, ?, ?, 0)`,
       [nombreCopropiedad, logoUrl, zoomEmbedUrl || '', parsed.meetingId, parsed.passcode, parsed.passcode]
     );
     const assemblyId = result.insertId;
+    assemblyZoomOpen.set(assemblyId, false);
 
     if (adminIdentificador && adminIdentificador.trim() !== '') {
       await db.query(
@@ -1924,7 +1973,7 @@ app.get('/api/reports/assembly/:id/pdf-data', async (req, res) => {
   }
 });
 
-// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM (SOPORTA ROLE 1 ANFITRIÓN + ZAK TOKEN PARA INICIAR SIN ABRIR LA APP DE ZOOM)
+// GENERADOR DE FIRMAS OFICIALES DEL SDK DE ZOOM
 app.post('/api/zoom/signature', async (req, res) => {
   try {
     const { meetingNumber, role } = req.body;
@@ -1957,7 +2006,6 @@ app.post('/api/zoom/signature', async (req, res) => {
     const hmac = crypto.createHmac('sha256', sdkSecret).update(dataToSign).digest();
     const signature = toBase64Url(hmac);
 
-    // Si es el moderador/admin (role === 1), intentar obtener el ZAK token de anfitrión por si están configuradas las credenciales S2S OAuth
     let zakToken = null;
     if (requestedRole === 1) {
       zakToken = await getZoomHostZakToken();
@@ -1969,13 +2017,27 @@ app.post('/api/zoom/signature', async (req, res) => {
   }
 });
 
+// CONSULTA DE PARÁMETROS DE ZOOM CON COMPUERTA DE BLOQUEO PARA ASISTENTES
 app.get('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode FROM asambleas WHERE id = ?`, [id]);
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Asamblea no encontrada' });
-    const parsed = parseZoomCredentials(rows[0].zoom_embed_url, rows[0].zoom_passcode);
-    res.json({ ok: true, zoom: { rawUrl: rows[0].zoom_embed_url, meetingId: rows[0].zoom_meeting_id || parsed.meetingId, passcode: rows[0].zoom_passcode || parsed.passcode } });
+    const isAdminQuery = req.query.admin === 'true';
+    const streamInfo = await getAssemblyZoomStreamInfo(id);
+
+    // Si consulta un asistente (index.html) y la compuerta de Zoom está cerrada, ocultar el meetingId para que nadie inicie la reunión ni la grabación antes de tiempo
+    if (!isAdminQuery && !streamInfo.zoomHabilitado) {
+      return res.json({
+        ok: true,
+        zoom: {
+          rawUrl: '',
+          meetingId: '',
+          passcode: '',
+          zoomHabilitado: false
+        }
+      });
+    }
+
+    res.json({ ok: true, zoom: streamInfo });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1984,18 +2046,48 @@ app.get('/api/assemblies/:id/zoom', async (req, res) => {
 app.put('/api/assemblies/:id/zoom', async (req, res) => {
   try {
     const { id } = req.params;
+    const targetAssembly = parseInt(id) || 1;
     const { zoomEmbedUrl, zoomPasscode } = req.body;
     const parsed = parseZoomCredentials(zoomEmbedUrl, zoomPasscode);
-    await db.query(`UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`, [zoomEmbedUrl, parsed.meetingId, parsed.passcode, id]);
-    const streamData = { meetingId: parsed.meetingId, passcode: parsed.passcode, rawUrl: zoomEmbedUrl };
-    io.to(`assembly_${id}`).emit('zoom:updated', { streamInfo: streamData });
+    await db.query(`UPDATE asambleas SET zoom_embed_url = ?, zoom_meeting_id = ?, zoom_passcode = ? WHERE id = ?`, [zoomEmbedUrl, parsed.meetingId, parsed.passcode, targetAssembly]);
+    const streamData = await getAssemblyZoomStreamInfo(targetAssembly);
+    io.to(`assembly_${targetAssembly}`).emit('zoom:updated', { streamInfo: streamData });
     res.json({ ok: true, message: 'Zoom actualizado.', streamInfo: streamData });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.3.0-host-start' }));
+// INTERRUPTOR EN ADMIN PARA ABRIR O CERRAR EL ACCESO A LA SALA DE ZOOM A LOS PARTICIPANTES
+app.put('/api/assemblies/:id/zoom-gate', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const targetAssembly = parseInt(id) || 1;
+    const { habilitado } = req.body;
+    const isOpen = !!habilitado;
+
+    assemblyZoomOpen.set(targetAssembly, isOpen);
+    try {
+      await db.query(`UPDATE asambleas SET zoom_habilitado = ? WHERE id = ?`, [isOpen ? 1 : 0, targetAssembly]);
+    } catch (e) {}
+
+    const streamData = await getAssemblyZoomStreamInfo(targetAssembly);
+    io.to(`assembly_${targetAssembly}`).emit('zoom:updated', { streamInfo: streamData });
+
+    res.json({
+      ok: true,
+      zoomHabilitado: isOpen,
+      streamInfo: streamData,
+      message: isOpen
+        ? '🔓 Sala de Zoom HABILITADA: Todos los participantes pueden ver e ingresar a la reunión.'
+        : '🔒 Sala de Zoom EN ESPERA: Los participantes no pueden iniciar ni entrar a la reunión hasta que la habilites.'
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.4.0-zoom-gate' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -2181,12 +2273,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Notificar a todos los asistentes cuando el moderador inicia la sala de Zoom desde admin.html
-  socket.on('admin:zoom_host_started', ({ assemblyId }) => {
+  // Cuando el moderador inicia la sala de Zoom desde admin.html, abrir automáticamente la compuerta y avisar a los asistentes
+  socket.on('admin:zoom_host_started', async ({ assemblyId }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
-    io.to(`assembly_${targetAssembly}`).emit('assembly:started', {
-      message: '¡La sala de video de la Asamblea ha sido iniciada por el moderador!'
-    });
+    assemblyZoomOpen.set(targetAssembly, true);
+    try {
+      await db.query(`UPDATE asambleas SET zoom_habilitado = 1 WHERE id = ?`, [targetAssembly]);
+    } catch (e) {}
+    const streamData = await getAssemblyZoomStreamInfo(targetAssembly);
+    io.to(`assembly_${targetAssembly}`).emit('zoom:updated', { streamInfo: streamData });
   });
 
   socket.on('admin:typing_question', ({ assemblyId, isTyping, textoPregunta, duracionSegundos, opciones }) => {
@@ -2208,7 +2303,7 @@ io.on('connection', (socket) => {
     io.to(`assembly_${targetAssembly}`).emit('question:draft_preview', draftPayload);
   });
 
-  // COLA ENUMERADA DE LEVANTAR / BAJAR LA MANO (100% EN VIVO, SIN ENSUCIAR EL CHAT)
+  // COLA ENUMERADA DE LEVANTAR / BAJAR LA MANO
   socket.on('chat:toggle_hand', ({ assemblyId, userId, identificadorUnico, nombreCompleto, unidad, raise }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     const effectiveUserId = userId !== undefined ? userId : (socket.userId || 0);
@@ -2520,4 +2615,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.3.0-host-start corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.4.0-zoom-gate corriendo en puerto ${PORT}`));
