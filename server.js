@@ -30,13 +30,14 @@ const timerIntervals = new Map();
 const activeSessions = new Map();
 const socketUserMap = new Map();
 
-// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS, COMPUERTA ZOOM Y BORRADOR
+// ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS, COMPUERTA ZOOM Y PERMISOS DE AUDIO/VIDEO
 const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
 const assemblyPinnedMessage = new Map(); // Mensaje anclado actual por asamblea
-const assemblyMutedUsers = new Map(); // Set de userId/identificador bloqueados por asamblea
+const assemblyMutedUsers = new Map(); // Set de userId/identificador bloqueados en chat por asamblea
 const assemblyDraftPreview = new Map(); // Estado actual de pregunta en redacción por asamblea
 const assemblyRaisedHands = new Map(); // Cola FIFO en vivo de manos levantadas por asamblea
 const assemblyZoomOpen = new Map(); // Compuerta para habilitar/ocultar el acceso a Zoom a los asistentes
+const assemblyMediaPermissions = new Map(); // Mapa de permisos individuales de { mic: boolean, cam: boolean } por asamblea
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -54,6 +55,23 @@ function getRaisedHandsForAssembly(assemblyId) {
     assemblyRaisedHands.set(target, []);
   }
   return assemblyRaisedHands.get(target);
+}
+
+function getMediaPermissionsMapForAssembly(assemblyId) {
+  const target = parseInt(assemblyId) || 1;
+  if (!assemblyMediaPermissions.has(target)) {
+    assemblyMediaPermissions.set(target, new Map());
+  }
+  return assemblyMediaPermissions.get(target);
+}
+
+function serializeMediaPermissions(assemblyId) {
+  const map = getMediaPermissionsMapForAssembly(assemblyId);
+  const obj = {};
+  for (const [k, v] of map.entries()) {
+    obj[k] = { mic: !!v.mic, cam: !!v.cam };
+  }
+  return obj;
 }
 
 function isZoomGateOpenForAssembly(assemblyId) {
@@ -316,7 +334,6 @@ async function initDbSchema() {
       } catch (e) {}
     }
 
-    // Sincronizar en memoria el estado inicial de la compuerta de Zoom desde la BD
     try {
       const [asmRows] = await db.query(`SELECT id, zoom_habilitado FROM asambleas`);
       asmRows.forEach(r => {
@@ -331,7 +348,6 @@ async function initDbSchema() {
 }
 initDbSchema();
 
-// GENERADOR DE CONTRASEÑAS EXCLUSIVAMENTE NUMÉRICAS PARA FACILITAR EL INGRESO DEL USUARIO
 function generateAlphanumericPassword(length = 6) {
   const firstDigits = '123456789';
   const allDigits = '0123456789';
@@ -456,7 +472,6 @@ async function getUserEffectiveCoefficient(userId, assemblyId) {
   return propio + coefPoderes;
 }
 
-// HELPER PARA OBTENER EL ESTADO ACTUAL DE QUÓRUM Y CONECTADOS DE UNA ASAMBLEA
 async function computeQuorumAndConnected(assemblyId) {
   const targetAssembly = parseInt(assemblyId) || 1;
   const activeList = [];
@@ -494,7 +509,6 @@ async function computeQuorumAndConnected(assemblyId) {
   return { quorumPercentage, total: activeList.length, usuarios: activeList };
 }
 
-// CÁLCULO Y TRANSMISIÓN EXACTA DEL QUÓRUM Y DE LOS COEFICIENTES EN VIVO
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
     const targetAssembly = parseInt(assemblyId) || 1;
@@ -579,7 +593,7 @@ app.get('/api/quorum/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
     const data = await computeQuorumAndConnected(assemblyId);
-    res.json({ ok: true, ...data });
+    res.json({ ok: true, ...data, mediaPermissions: serializeMediaPermissions(assemblyId) });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -874,10 +888,6 @@ app.post('/api/assemblies/:id/start', async (req, res) => {
     const streamInfo = await getAssemblyZoomStreamInfo(targetAssembly);
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('zoom:updated', { streamInfo });
-    io.to(roomName).emit('assembly:started', {
-      message: '¡La Asamblea ha iniciado oficialmente!',
-      horaInicio: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    });
     io.emit('assemblies:updated');
 
     res.json({ ok: true, message: 'Asamblea iniciada oficialmente y sala de Zoom abierta.', horaInicio: now, streamInfo });
@@ -901,10 +911,6 @@ app.post('/api/assemblies/:id/close', async (req, res) => {
     const streamInfo = await getAssemblyZoomStreamInfo(targetAssembly);
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('zoom:updated', { streamInfo });
-    io.to(roomName).emit('assembly:closed', {
-      message: 'La Asamblea ha sido cerrada de manera oficial.',
-      horaCierre: now.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    });
     io.emit('assemblies:updated');
 
     res.json({ ok: true, message: 'Asamblea finalizada y cerrada oficialmente.', horaCierre: now });
@@ -929,6 +935,7 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
     assemblyDraftPreview.delete(targetAssembly);
     assemblyRaisedHands.delete(targetAssembly);
     assemblyZoomOpen.delete(targetAssembly);
+    assemblyMediaPermissions.delete(targetAssembly);
 
     const cleanupSteps = [
       { name: 'votos', query: `DELETE FROM votos WHERE assembly_id = ?`, params: [targetAssembly] },
@@ -986,6 +993,7 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
     assemblyMutedUsers.delete(targetAssembly);
     assemblyDraftPreview.delete(targetAssembly);
     assemblyRaisedHands.delete(targetAssembly);
+    assemblyMediaPermissions.delete(targetAssembly);
     for (let i = memoryChat.length - 1; i >= 0; i--) {
       if (parseInt(memoryChat[i].assemblyId) === targetAssembly) {
         memoryChat.splice(i, 1);
@@ -1813,7 +1821,6 @@ app.post('/api/powers', async (req, res) => {
                 <p style="margin: 6px 0; font-size: 14px;"><strong>Estado:</strong> <span style="color: #f59e0b; font-weight: bold;">PENDIENTE DE REVISIÓN</span></p>
               </div>
 
-              <!-- BOTONES DE ACCIÓN DIRECTA -->
               <div style="text-align: center; margin: 25px 0;">
                 <a href="${approveLink}" target="_blank" style="background-color: #10b981; color: #ffffff; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block; margin-right: 10px; font-size: 14px;">
                   ✓ APROBAR PODER
@@ -2024,7 +2031,6 @@ app.get('/api/assemblies/:id/zoom', async (req, res) => {
     const isAdminQuery = req.query.admin === 'true';
     const streamInfo = await getAssemblyZoomStreamInfo(id);
 
-    // Si consulta un asistente (index.html) y la compuerta de Zoom está cerrada, ocultar el meetingId para que nadie inicie la reunión ni la grabación antes de tiempo
     if (!isAdminQuery && !streamInfo.zoomHabilitado) {
       return res.json({
         ok: true,
@@ -2087,7 +2093,7 @@ app.put('/api/assemblies/:id/zoom-gate', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.4.0-zoom-gate' }));
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.5.0-media-permissions' }));
 
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
@@ -2219,13 +2225,19 @@ io.on('connection', (socket) => {
       const mutedSet = getMutedSetForAssembly(targetAssembly);
       const mutedArray = Array.from(mutedSet);
       const raisedHandsNow = getRaisedHandsForAssembly(targetAssembly);
+      const mediaPermsObj = serializeMediaPermissions(targetAssembly);
 
       socket.emit('chat:history', {
         messages: chatHistoryAssembly,
         paused: isPausedNow,
         pinnedMessage: pinnedNow,
         mutedUsers: mutedArray,
-        raisedHands: raisedHandsNow
+        raisedHands: raisedHandsNow,
+        mediaPermissions: mediaPermsObj
+      });
+
+      socket.emit('media:permissions_updated', {
+        mediaPermissions: mediaPermsObj
       });
 
       if (assemblyDraftPreview.has(targetAssembly)) {
@@ -2273,7 +2285,39 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Cuando el moderador inicia la sala de Zoom desde admin.html, abrir automáticamente la compuerta y avisar a los asistentes
+  // =========================================================================
+  // CONTROL DE PERMISOS DE MICRÓFONO Y CÁMARA POR COPROPIETARIO DESDE ADMIN
+  // =========================================================================
+  socket.on('admin:toggle_user_media', ({ assemblyId, targetKey, mediaType, allow }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    if (!targetKey || !['mic', 'cam'].includes(mediaType)) return;
+
+    const cleanKey = String(targetKey).trim().toUpperCase();
+    const map = getMediaPermissionsMapForAssembly(targetAssembly);
+    const current = map.get(cleanKey) || { mic: false, cam: false };
+
+    current[mediaType] = !!allow;
+    map.set(cleanKey, current);
+
+    io.to(`assembly_${targetAssembly}`).emit('media:permissions_updated', {
+      mediaPermissions: serializeMediaPermissions(targetAssembly),
+      changedKey: cleanKey,
+      changedType: mediaType,
+      allowed: !!allow
+    });
+  });
+
+  // Revocar micrófono y cámara a todos los copropietarios de un solo clic
+  socket.on('admin:revoke_all_media', ({ assemblyId }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    assemblyMediaPermissions.set(targetAssembly, new Map());
+
+    io.to(`assembly_${targetAssembly}`).emit('media:permissions_updated', {
+      mediaPermissions: {},
+      revokedAll: true
+    });
+  });
+
   socket.on('admin:zoom_host_started', async ({ assemblyId }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     assemblyZoomOpen.set(targetAssembly, true);
@@ -2615,4 +2659,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.4.0-zoom-gate corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor de Asambleas v3.5.0-media-permissions corriendo en puerto ${PORT}`));
