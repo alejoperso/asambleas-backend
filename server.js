@@ -91,7 +91,7 @@ function getZoomServerUnixTime() {
       }
       resolve(Math.floor(Date.now() / 1000));
     });
-    req.on('error', () => resolve(Math.floor(Date.now() / 1000)));
+    req.on('error', () => resolve(Math.floor(Date.now() / 1000));
     req.on('timeout', () => {
       req.destroy();
       resolve(Math.floor(Date.now() / 1000));
@@ -499,23 +499,48 @@ async function computeQuorumAndConnected(assemblyId) {
   }
 
   let totalQuorum = 0;
+  let totalPropiedades = 0;
+
   if (activeUserIds.size > 0) {
     for (let uId of activeUserIds) {
       totalQuorum += await getUserEffectiveCoefficient(uId, targetAssembly);
+
+      const { isRepresented } = await checkUserRepresentedStatus(uId, targetAssembly);
+      if (isRepresented) continue;
+
+      const [u] = await db.query(`SELECT coeficiente, rol FROM usuarios WHERE id = ?`, [uId]);
+      if (u.length === 0) continue;
+
+      const rolLower = (u[0].rol || '').toLowerCase();
+      const propioCoef = parseFloat(u[0].coeficiente) || 0;
+      const isControlRole = ['soporte', 'superadmin', 'moderador', 'administrador', 'representante_legal'].includes(rolLower);
+
+      if (!isControlRole && propioCoef > 0) {
+        totalPropiedades += 1;
+      }
+
+      const { representadosAprobados } = await getUserPowerDetails(uId, targetAssembly);
+      if (Array.isArray(representadosAprobados) && representadosAprobados.length > 0) {
+        for (const rep of representadosAprobados) {
+          if ((parseFloat(rep.coeficiente) || 0) > 0) {
+            totalPropiedades += 1;
+          }
+        }
+      }
     }
   }
 
   const quorumPercentage = totalQuorum.toFixed(4);
-  return { quorumPercentage, total: activeList.length, usuarios: activeList };
+  return { quorumPercentage, totalPropiedades, total: activeList.length, usuarios: activeList };
 }
 
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
     const targetAssembly = parseInt(assemblyId) || 1;
-    const { quorumPercentage, total, usuarios } = await computeQuorumAndConnected(targetAssembly);
+    const { quorumPercentage, totalPropiedades, total, usuarios } = await computeQuorumAndConnected(targetAssembly);
 
-    io.to(`assembly_${targetAssembly}`).emit('quorum:update', { quorumPercentage });
-    io.to(`assembly_${targetAssembly}`).emit('users:connected_update', { total, usuarios });
+    io.to(`assembly_${targetAssembly}`).emit('quorum:update', { quorumPercentage, totalPropiedades });
+    io.to(`assembly_${targetAssembly}`).emit('users:connected_update', { total, totalPropiedades, usuarios });
   } catch (err) {
     console.error('Error calculando quórum:', err);
   }
