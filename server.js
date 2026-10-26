@@ -91,7 +91,9 @@ function getZoomServerUnixTime() {
       }
       resolve(Math.floor(Date.now() / 1000));
     });
-    req.on('error', () => resolve(Math.floor(Date.now() / 1000));
+    req.on('error', () => {
+      resolve(Math.floor(Date.now() / 1000));
+    });
     req.on('timeout', () => {
       req.destroy();
       resolve(Math.floor(Date.now() / 1000));
