@@ -39,6 +39,10 @@ const timerIntervals = new Map();
 const activeSessions = new Map();
 const socketUserMap = new Map();
 
+// MAPAS EN MEMORIA PARA EL TEMPORIZADOR DE USO DE LA PALABRA EN TIEMPO REAL
+const activeSpeakerTimers = new Map();
+const speakerTimerIntervals = new Map();
+
 // ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS, COMPUERTA ZOOM Y PERMISOS DE AUDIO/VIDEO
 const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
 const assemblyPinnedMessage = new Map(); // Mensaje anclado actual por asamblea
@@ -1010,6 +1014,12 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
       activeQuestions.delete(targetAssembly);
     }
 
+    if (speakerTimerIntervals.has(targetAssembly)) {
+      clearInterval(speakerTimerIntervals.get(targetAssembly));
+      speakerTimerIntervals.delete(targetAssembly);
+    }
+    activeSpeakerTimers.delete(targetAssembly);
+
     assemblyDraftPreview.delete(targetAssembly);
     assemblyRaisedHands.delete(targetAssembly);
     assemblyZoomOpen.delete(targetAssembly);
@@ -1066,6 +1076,12 @@ app.post('/api/superadmin/assemblies/:id/reset', async (req, res) => {
       }
       activeQuestions.delete(targetAssembly);
     }
+
+    if (speakerTimerIntervals.has(targetAssembly)) {
+      clearInterval(speakerTimerIntervals.get(targetAssembly));
+      speakerTimerIntervals.delete(targetAssembly);
+    }
+    activeSpeakerTimers.delete(targetAssembly);
 
     assemblyPinnedMessage.delete(targetAssembly);
     assemblyMutedUsers.delete(targetAssembly);
@@ -2366,6 +2382,10 @@ io.on('connection', (socket) => {
         mediaPermissions: mediaPermsObj
       });
 
+      if (activeSpeakerTimers.has(targetAssembly)) {
+        socket.emit('speaker:timer_state', activeSpeakerTimers.get(targetAssembly));
+      }
+
       if (assemblyDraftPreview.has(targetAssembly)) {
         socket.emit('question:draft_preview', assemblyDraftPreview.get(targetAssembly));
       }
@@ -2446,6 +2466,137 @@ io.on('connection', (socket) => {
       mediaPermissions: {},
       revokedAll: true
     });
+  });
+
+  // TEMPORIZADOR DE USO DE LA PALABRA EN TIEMPO REAL DESDE ADMIN
+  socket.on('admin:start_speaker_timer', ({ assemblyId, durationSeconds, targetKey, targetName, autoMuteOnExpire }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    const dur = Math.max(5, parseInt(durationSeconds) || 120);
+    const cleanKey = String(targetKey || '').trim().toUpperCase();
+    const cleanName = String(targetName || cleanKey || 'Asistente').trim();
+    const shouldAutoMute = autoMuteOnExpire !== false;
+
+    if (speakerTimerIntervals.has(targetAssembly)) {
+      clearInterval(speakerTimerIntervals.get(targetAssembly));
+      speakerTimerIntervals.delete(targetAssembly);
+    }
+
+    // Al iniciar su tiempo de palabra, habilitarle automáticamente el micrófono
+    if (cleanKey) {
+      const map = getMediaPermissionsMapForAssembly(targetAssembly);
+      const current = map.get(cleanKey) || { mic: false, cam: false };
+      current.mic = true;
+      map.set(cleanKey, current);
+
+      io.to(`assembly_${targetAssembly}`).emit('media:permissions_updated', {
+        mediaPermissions: serializeMediaPermissions(targetAssembly),
+        changedKey: cleanKey,
+        changedType: 'mic',
+        allowed: true
+      });
+    }
+
+    const timerData = {
+      isOpen: true,
+      duracion: dur,
+      tiempoRestante: dur,
+      targetKey: cleanKey,
+      targetName: cleanName,
+      autoMuteOnExpire: shouldAutoMute
+    };
+
+    activeSpeakerTimers.set(targetAssembly, timerData);
+    const roomName = `assembly_${targetAssembly}`;
+
+    io.to(roomName).emit('speaker:timer_state', timerData);
+
+    const interval = setInterval(() => {
+      const currentTimer = activeSpeakerTimers.get(targetAssembly);
+      if (!currentTimer || !currentTimer.isOpen) {
+        clearInterval(interval);
+        speakerTimerIntervals.delete(targetAssembly);
+        return;
+      }
+
+      currentTimer.tiempoRestante -= 1;
+      io.to(roomName).emit('speaker:timer_tick', {
+        tiempoRestante: Math.max(0, currentTimer.tiempoRestante),
+        duracion: currentTimer.duracion,
+        targetKey: currentTimer.targetKey,
+        targetName: currentTimer.targetName
+      });
+
+      if (currentTimer.tiempoRestante <= 0) {
+        clearInterval(interval);
+        speakerTimerIntervals.delete(targetAssembly);
+        currentTimer.isOpen = false;
+
+        if (currentTimer.autoMuteOnExpire && currentTimer.targetKey) {
+          const map = getMediaPermissionsMapForAssembly(targetAssembly);
+          const currentPerm = map.get(currentTimer.targetKey) || { mic: false, cam: false };
+          currentPerm.mic = false;
+          map.set(currentTimer.targetKey, currentPerm);
+
+          io.to(roomName).emit('media:permissions_updated', {
+            mediaPermissions: serializeMediaPermissions(targetAssembly),
+            changedKey: currentTimer.targetKey,
+            changedType: 'mic',
+            allowed: false
+          });
+
+          const handsQueue = getRaisedHandsForAssembly(targetAssembly);
+          const idx = handsQueue.findIndex(h => h.key === currentTimer.targetKey || String(h.userId).toUpperCase() === currentTimer.targetKey);
+          if (idx !== -1) {
+            handsQueue.splice(idx, 1);
+            io.to(roomName).emit('chat:hands_updated', { raisedHands: handsQueue });
+          }
+        }
+
+        io.to(roomName).emit('speaker:timer_expired', {
+          targetKey: currentTimer.targetKey,
+          targetName: currentTimer.targetName
+        });
+        activeSpeakerTimers.delete(targetAssembly);
+      }
+    }, 1000);
+
+    speakerTimerIntervals.set(targetAssembly, interval);
+  });
+
+  socket.on('admin:stop_speaker_timer', ({ assemblyId, muteUser }) => {
+    const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
+    const currentTimer = activeSpeakerTimers.get(targetAssembly);
+
+    if (speakerTimerIntervals.has(targetAssembly)) {
+      clearInterval(speakerTimerIntervals.get(targetAssembly));
+      speakerTimerIntervals.delete(targetAssembly);
+    }
+
+    const roomName = `assembly_${targetAssembly}`;
+
+    if (muteUser && currentTimer && currentTimer.targetKey) {
+      const map = getMediaPermissionsMapForAssembly(targetAssembly);
+      const currentPerm = map.get(currentTimer.targetKey) || { mic: false, cam: false };
+      currentPerm.mic = false;
+      map.set(currentTimer.targetKey, currentPerm);
+
+      io.to(roomName).emit('media:permissions_updated', {
+        mediaPermissions: serializeMediaPermissions(targetAssembly),
+        changedKey: currentTimer.targetKey,
+        changedType: 'mic',
+        allowed: false
+      });
+
+      const handsQueue = getRaisedHandsForAssembly(targetAssembly);
+      const idx = handsQueue.findIndex(h => h.key === currentTimer.targetKey || String(h.userId).toUpperCase() === currentTimer.targetKey);
+      if (idx !== -1) {
+        handsQueue.splice(idx, 1);
+        io.to(roomName).emit('chat:hands_updated', { raisedHands: handsQueue });
+      }
+    }
+
+    activeSpeakerTimers.delete(targetAssembly);
+    io.to(roomName).emit('speaker:timer_state', { isOpen: false, tiempoRestante: 0 });
   });
 
   socket.on('admin:zoom_host_started', async ({ assemblyId }) => {
