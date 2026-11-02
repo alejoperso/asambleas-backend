@@ -362,6 +362,7 @@ async function initDbSchema() {
         await db.query(q);
       } catch (e) {}
     }
+
     try {
       const [asmRows] = await db.query(`SELECT id, zoom_habilitado FROM asambleas`);
       asmRows.forEach(r => {
@@ -563,16 +564,17 @@ async function computeQuorumAndConnected(assemblyId) {
       }
     }
   }
-// =========================================================================
-// FIN SECCION 06: LOGICA DE NEGOCIO (ZOOM, PODERES, QUORUM Y COEFICIENTES)
-// =========================================================================
-// =========================================================================
-// INICIO SECCION 07: ESTADISTICAS Y CALCULO DE RESULTADOS DE VOTACION
-// =========================================================================
+
   const quorumPercentage = totalQuorum.toFixed(4);
   return { quorumPercentage, totalPropiedades, total: activeList.length, usuarios: activeList };
 }
+// =========================================================================
+// FIN SECCION 06: LOGICA DE NEGOCIO (ZOOM, PODERES, QUORUM Y COEFICIENTES)
+// =========================================================================
 
+// =========================================================================
+// INICIO SECCION 07: ESTADISTICAS Y CALCULO DE RESULTADOS DE VOTACION
+// =========================================================================
 async function updateAndBroadcastQuorum(assemblyId) {
   try {
     const targetAssembly = parseInt(assemblyId) || 1;
@@ -807,10 +809,132 @@ app.post('/api/superadmin/admin-users', async (req, res) => {
         hashedPassword = existing[0].password;
       }
     }
+
+    if (hashedPassword) {
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
+         VALUES (?, ?, ?, 'GESTIÓN', ?, ?, 0.00000, ?)
+         ON DUPLICATE KEY UPDATE 
+           nombre_completo = VALUES(nombre_completo),
+           password = VALUES(password),
+           rol = VALUES(rol),
+           assembly_id = VALUES(assembly_id)`,
+        [targetAssembly, identificadorUnico, cleanName, cleanEmail, hashedPassword, rol]
+      );
+    } else {
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
+         VALUES (?, ?, ?, 'GESTIÓN', ?, '', 0.00000, ?)
+         ON DUPLICATE KEY UPDATE 
+           nombre_completo = VALUES(nombre_completo),
+           rol = VALUES(rol),
+           assembly_id = VALUES(assembly_id)`,
+        [targetAssembly, identificadorUnico, cleanName, cleanEmail, rol]
+      );
+    }
+
+    res.json({ ok: true, message: `Usuario con rol [${rol}] guardado correctamente.` });
+  } catch (err) {
+    console.error('Error al crear/actualizar admin user:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ENVIAR CORREO CON CREDENCIALES NUMÉRICAS AL PERSONAL DE CONTROL
+app.post('/api/superadmin/admin-users/send-credential', async (req, res) => {
+  try {
+    const { userId, customPassword } = req.body;
+    if (!userId) return res.status(400).json({ ok: false, error: 'ID de usuario requerido.' });
+
+    const [usuarios] = await db.query(
+      `SELECT u.id, u.identificador_unico, u.nombre_completo, u.email, u.rol, u.assembly_id, a.nombre_copropiedad 
+       FROM usuarios u 
+       LEFT JOIN asambleas a ON u.assembly_id = a.id 
+       WHERE u.id = ?`,
+      [userId]
+    );
+
+    if (usuarios.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Usuario de control no encontrado.' });
+    }
+
+    const user = usuarios[0];
+    if (!user.email || user.email.trim() === '') {
+      return res.status(400).json({ ok: false, error: 'El usuario no tiene un correo electrónico registrado.' });
+    }
+
+    const plainPassword = (customPassword && customPassword.trim() !== '') 
+      ? customPassword.trim() 
+      : generateAlphanumericPassword(6);
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(plainPassword, salt);
+
+    await db.query(
+      `UPDATE usuarios SET password = ? WHERE id = ? OR (LOWER(email) = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal'))`,
+      [hashedPassword, user.id, user.email.trim().toLowerCase()]
+    );
+
+    const clientUrl = process.env.CLIENT_URL || req.headers.origin || 'https://asambleas.ajaudiovisual.com';
+    const adminUrl = `${clientUrl}/admin.html?asamblea=${user.assembly_id || 1}`;
+    const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
+    const copropiedadNombre = user.nombre_copropiedad || 'Asamblea Virtual';
+    const rolNombre = user.rol === 'administrador' ? 'Administrador' : user.rol === 'moderador' ? 'Moderador' : user.rol === 'representante_legal' ? 'Representante Legal' : 'Soporte Técnico';
+
+    const emailResult = await resend.emails.send({
+      from: `Plataforma Asambleas <${fromSender}>`,
+      to: [user.email],
+      subject: `Acceso Panel de Control (${rolNombre}) - ${copropiedadNombre}`,
+      text: `Estimado(a) ${user.nombre_completo}, se te han asignado permisos de ${rolNombre} para ${copropiedadNombre}. URL: ${adminUrl} | Usuario: ${user.email} | Contraseña Numérica: ${plainPassword}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
+          <h2 style="color: #6366f1; text-align: center; margin-bottom: 20px;">Acceso a Consola de Control</h2>
+          <p style="font-size: 14px; line-height: 1.6;">Estimado(a) <strong>${user.nombre_completo}</strong>,</p>
+          <p style="font-size: 14px; line-height: 1.6;">Se le han otorgado credenciales de acceso como <strong>${rolNombre}</strong> para la gestión de <strong>${copropiedadNombre}</strong>.</p>
+          
+          <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 20px 0;">
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Enlace de Control:</strong> <a href="${adminUrl}" style="color: #38bdf8; word-break: break-all;">${adminUrl}</a></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Usuario (Correo):</strong> <span style="color: #f1f5f9; font-weight: bold;">${user.email}</span></p>
+            <p style="margin: 6px 0; font-size: 14px;"><strong>Contraseña Numérica Asignada:</strong> <span style="background-color: #334155; padding: 3px 10px; border-radius: 4px; font-family: monospace; font-size: 18px; letter-spacing: 2px; font-weight: bold; color: #facc15;">${plainPassword}</span></p>
+          </div>
+
+          <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
+            Mensaje automático del Sistema de Asambleas Virtuales.
+          </p>
+        </div>
+      `
+    });
+
+    if (emailResult.error) {
+      return res.status(500).json({ ok: false, error: emailResult.error.message });
+    }
+
+    return res.json({
+      ok: true,
+      message: `Credenciales de control enviadas a ${user.email}.`,
+      plainPassword: plainPassword
+    });
+
+  } catch (err) {
+    console.error('Error enviando credencial de control:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/superadmin/admin-users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query(`DELETE FROM usuarios WHERE id = ? AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')`, [id]);
+    res.json({ ok: true, message: 'Usuario de gestión eliminado.' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 // =========================================================================
 // FIN SECCION 08: API REST - QUORUM, AUTENTICACION ADMIN Y GESTION SUPERADMIN
 // =========================================================================
-  // =========================================================================
+
+// =========================================================================
 // INICIO SECCION 09: API REST - CICLO DE VIDA Y ADMINISTRACION DE ASAMBLEAS
 // =========================================================================
 // REST API: ASAMBLEAS ACTIVAS
@@ -908,6 +1032,7 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
         console.warn(`Aviso durante limpieza de [${step.name}]:`, errStep.message);
       }
     }
+
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('assembly:deleted', { message: 'Esta asamblea ha sido eliminada por la administración general.' });
     io.emit('assemblies:updated');
@@ -1350,7 +1475,7 @@ app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
 // =========================================================================
 
 // =========================================================================
-// INICIO SECCION 11: API REST - DETALLES DE ASAMBLEAS Y DOCUMENTOS
+// INICIO SECCION 11: API REST - DETALLES DE ASAMBLEAS Y DOCUMENTOS (LECTURA)
 // =========================================================================
 app.get('/api/assemblies/:id', async (req, res) => {
   try {
@@ -1403,7 +1528,11 @@ app.get('/api/documents/:assemblyId', async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
-    // =========================================================================
+// =========================================================================
+// FIN SECCION 11: API REST - DETALLES DE ASAMBLEAS Y DOCUMENTOS (LECTURA)
+// =========================================================================
+
+// =========================================================================
 // INICIO SECCION 12: API REST - GESTION DE DOCUMENTOS DE ASAMBLEA
 // =========================================================================
 app.post('/api/documents', async (req, res) => {
@@ -1833,7 +1962,8 @@ app.post('/api/powers', async (req, res) => {
 // =========================================================================
 // FIN SECCION 14: API REST - GESTION DE PODERES Y ACCIONES DIRECTAS EMAIL
 // =========================================================================
-  // =========================================================================
+
+// =========================================================================
 // INICIO SECCION 15: API REST - CONSULTA DE USUARIOS Y REPORTES (EXCEL Y PDF)
 // =========================================================================
 app.get('/api/users/:assemblyId', async (req, res) => {
@@ -2283,7 +2413,8 @@ io.on('connection', (socket) => {
 // =========================================================================
 // FIN SECCION 17: SOCKET.IO - CONEXION, AUTENTICACION Y QUORUM EN VIVO
 // =========================================================================
-      // =========================================================================
+
+// =========================================================================
 // INICIO SECCION 18: SOCKET.IO - PERMISOS MEDIA, MANOS LEVANTADAS Y CHAT
 // =========================================================================
   // CONTROL DE PERMISOS DE MICRÓFONO Y CÁMARA POR COPROPIETARIO DESDE ADMIN
