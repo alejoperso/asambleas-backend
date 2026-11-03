@@ -42,6 +42,7 @@ const socketUserMap = new Map();
 // MAPAS EN MEMORIA PARA EL TEMPORIZADOR DE USO DE LA PALABRA EN TIEMPO REAL
 const activeSpeakerTimers = new Map();
 const speakerTimerIntervals = new Map();
+const assemblySpeakerAutoMute = new Map(); // Configuración a nivel de asamblea: true = cierra mic al terminar tiempo, false = mantiene mic abierto
 
 // ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS, COMPUERTA ZOOM Y PERMISOS DE AUDIO/VIDEO
 const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
@@ -90,6 +91,14 @@ function serializeMediaPermissions(assemblyId) {
 function isZoomGateOpenForAssembly(assemblyId) {
   const target = parseInt(assemblyId) || 1;
   return assemblyZoomOpen.get(target) === true;
+}
+
+function isAutoMuteSpeakerForAssembly(assemblyId) {
+  const target = parseInt(assemblyId) || 1;
+  if (!assemblySpeakerAutoMute.has(target)) {
+    assemblySpeakerAutoMute.set(target, true);
+  }
+  return assemblySpeakerAutoMute.get(target) === true;
 }
 // =========================================================================
 // FIN SECCION 02: ESTRUCTURAS EN MEMORIA Y HELPERS AUXILIARES
@@ -256,6 +265,7 @@ async function initDbSchema() {
         zoom_passcode VARCHAR(100) NULL,
         zoom_password VARCHAR(100) NULL,
         zoom_habilitado TINYINT(1) DEFAULT 0,
+        auto_mute_speaker TINYINT(1) DEFAULT 1,
         fecha_evento DATE NULL,
         hora_inicio DATETIME NULL,
         hora_cierre DATETIME NULL,
@@ -357,6 +367,7 @@ async function initDbSchema() {
       `ALTER TABLE asambleas MODIFY COLUMN estado VARCHAR(50) DEFAULT 'programada'`,
       `ALTER TABLE asambleas MODIFY COLUMN zoom_embed_url LONGTEXT NULL`,
       `ALTER TABLE asambleas ADD COLUMN zoom_habilitado TINYINT(1) DEFAULT 0`,
+      `ALTER TABLE asambleas ADD COLUMN auto_mute_speaker TINYINT(1) DEFAULT 1`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
@@ -368,9 +379,11 @@ async function initDbSchema() {
     }
 
     try {
-      const [asmRows] = await db.query(`SELECT id, zoom_habilitado FROM asambleas`);
+      const [asmRows] = await db.query(`SELECT id, zoom_habilitado, auto_mute_speaker FROM asambleas`);
       asmRows.forEach(r => {
-        assemblyZoomOpen.set(parseInt(r.id), r.zoom_habilitado === 1);
+        const idNum = parseInt(r.id);
+        assemblyZoomOpen.set(idNum, r.zoom_habilitado === 1);
+        assemblySpeakerAutoMute.set(idNum, r.auto_mute_speaker !== 0);
       });
     } catch (e) {}
 
@@ -420,21 +433,24 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
 async function getAssemblyZoomStreamInfo(assemblyId) {
   const target = parseInt(assemblyId) || 1;
   try {
-    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_habilitado FROM asambleas WHERE id = ?`, [target]);
+    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_habilitado, auto_mute_speaker FROM asambleas WHERE id = ?`, [target]);
     if (rows.length === 0) {
-      return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: false };
+      return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: false, autoMuteSpeaker: isAutoMuteSpeakerForAssembly(target) };
     }
     const parsed = parseZoomCredentials(rows[0].zoom_embed_url, rows[0].zoom_passcode);
     const isEnabled = assemblyZoomOpen.has(target) ? assemblyZoomOpen.get(target) : (rows[0].zoom_habilitado === 1);
+    const isAutoMute = assemblySpeakerAutoMute.has(target) ? assemblySpeakerAutoMute.get(target) : (rows[0].auto_mute_speaker !== 0);
     assemblyZoomOpen.set(target, !!isEnabled);
+    assemblySpeakerAutoMute.set(target, !!isAutoMute);
     return {
       rawUrl: rows[0].zoom_embed_url || '',
       meetingId: rows[0].zoom_meeting_id || parsed.meetingId,
       passcode: rows[0].zoom_passcode || parsed.passcode,
-      zoomHabilitado: !!isEnabled
+      zoomHabilitado: !!isEnabled,
+      autoMuteSpeaker: !!isAutoMute
     };
   } catch (err) {
-    return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: isZoomGateOpenForAssembly(target) };
+    return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: isZoomGateOpenForAssembly(target), autoMuteSpeaker: isAutoMuteSpeakerForAssembly(target) };
   }
 }
 
@@ -959,10 +975,17 @@ app.post('/api/assemblies/:id/start', async (req, res) => {
   try {
     const { id } = req.params;
     const targetAssembly = parseInt(id) || 1;
+    const { autoMuteSpeaker } = req.body || {};
     const now = new Date();
     assemblyZoomOpen.set(targetAssembly, true);
+
+    if (typeof autoMuteSpeaker === 'boolean') {
+      assemblySpeakerAutoMute.set(targetAssembly, autoMuteSpeaker);
+    }
+    const autoMuteVal = isAutoMuteSpeakerForAssembly(targetAssembly) ? 1 : 0;
+
     try {
-      await db.query(`UPDATE asambleas SET estado = 'en_curso', zoom_habilitado = 1, hora_inicio = NOW() WHERE id = ?`, [targetAssembly]);
+      await db.query(`UPDATE asambleas SET estado = 'en_curso', zoom_habilitado = 1, auto_mute_speaker = ?, hora_inicio = NOW() WHERE id = ?`, [autoMuteVal, targetAssembly]);
     } catch (e) {
       await db.query(`UPDATE asambleas SET estado = 'en_curso' WHERE id = ?`, [targetAssembly]);
     }
@@ -970,9 +993,16 @@ app.post('/api/assemblies/:id/start', async (req, res) => {
     const streamInfo = await getAssemblyZoomStreamInfo(targetAssembly);
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('zoom:updated', { streamInfo });
+    io.to(roomName).emit('speaker:config_updated', { autoMuteSpeaker: isAutoMuteSpeakerForAssembly(targetAssembly) });
     io.emit('assemblies:updated');
 
-    res.json({ ok: true, message: 'Asamblea iniciada oficialmente y sala de Zoom abierta.', horaInicio: now, streamInfo });
+    res.json({
+      ok: true,
+      message: 'Asamblea iniciada oficialmente y sala de Zoom abierta.',
+      horaInicio: now,
+      streamInfo,
+      autoMuteSpeaker: isAutoMuteSpeakerForAssembly(targetAssembly)
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1019,6 +1049,7 @@ app.delete('/api/superadmin/assemblies/:id', async (req, res) => {
       speakerTimerIntervals.delete(targetAssembly);
     }
     activeSpeakerTimers.delete(targetAssembly);
+    assemblySpeakerAutoMute.delete(targetAssembly);
 
     assemblyDraftPreview.delete(targetAssembly);
     assemblyRaisedHands.delete(targetAssembly);
@@ -1191,6 +1222,7 @@ app.post('/api/superadmin/assemblies', async (req, res) => {
     );
     const assemblyId = result.insertId;
     assemblyZoomOpen.set(assemblyId, false);
+    assemblySpeakerAutoMute.set(assemblyId, true);
 
     if (adminIdentificador && adminIdentificador.trim() !== '') {
       await db.query(
@@ -2174,7 +2206,8 @@ app.get('/api/assemblies/:id/zoom', async (req, res) => {
           rawUrl: '',
           meetingId: '',
           passcode: '',
-          zoomHabilitado: false
+          zoomHabilitado: false,
+          autoMuteSpeaker: streamInfo.autoMuteSpeaker
         }
       });
     }
@@ -2229,7 +2262,38 @@ app.put('/api/assemblies/:id/zoom-gate', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'online', version: '3.5.0-media-permissions' }));
+// CONFIGURACIÓN A NIVEL DE ASAMBLEA: CERRAR O NO EL MICRÓFONO AL TERMINAR EL TIEMPO DE PALABRA
+app.put('/api/assemblies/:id/speaker-config', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const targetAssembly = parseInt(id) || 1;
+    const { autoMuteSpeaker } = req.body;
+    const isAutoMute = !!autoMuteSpeaker;
+
+    assemblySpeakerAutoMute.set(targetAssembly, isAutoMute);
+    try {
+      await db.query(`UPDATE asambleas SET auto_mute_speaker = ? WHERE id = ?`, [isAutoMute ? 1 : 0, targetAssembly]);
+    } catch (e) {}
+
+    if (activeSpeakerTimers.has(targetAssembly)) {
+      const currentTimer = activeSpeakerTimers.get(targetAssembly);
+      currentTimer.autoMuteOnExpire = isAutoMute;
+    }
+
+    io.to(`assembly_${targetAssembly}`).emit('speaker:config_updated', {
+      autoMuteSpeaker: isAutoMute
+    });
+
+    res.json({
+      ok: true,
+      autoMuteSpeaker: isAutoMute
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/', (req, res) => res.json({ status: 'online', version: '3.6.0-speaker-timer' }));
 // =========================================================================
 // FIN SECCION 16: API REST - FIRMAS JWT ZOOM SDK Y COMPUERTA DE SALA
 // =========================================================================
@@ -2382,8 +2446,15 @@ io.on('connection', (socket) => {
         mediaPermissions: mediaPermsObj
       });
 
+      socket.emit('speaker:config_updated', {
+        autoMuteSpeaker: isAutoMuteSpeakerForAssembly(targetAssembly)
+      });
+
       if (activeSpeakerTimers.has(targetAssembly)) {
-        socket.emit('speaker:timer_state', activeSpeakerTimers.get(targetAssembly));
+        socket.emit('speaker:timer_state', {
+          ...activeSpeakerTimers.get(targetAssembly),
+          justStarted: false
+        });
       }
 
       if (assemblyDraftPreview.has(targetAssembly)) {
@@ -2469,19 +2540,19 @@ io.on('connection', (socket) => {
   });
 
   // TEMPORIZADOR DE USO DE LA PALABRA EN TIEMPO REAL DESDE ADMIN
-  socket.on('admin:start_speaker_timer', ({ assemblyId, durationSeconds, targetKey, targetName, autoMuteOnExpire }) => {
+  socket.on('admin:start_speaker_timer', ({ assemblyId, durationSeconds, targetKey, targetName }) => {
     const targetAssembly = parseInt(assemblyId || socket.assemblyId || 1);
     const dur = Math.max(5, parseInt(durationSeconds) || 120);
     const cleanKey = String(targetKey || '').trim().toUpperCase();
     const cleanName = String(targetName || cleanKey || 'Asistente').trim();
-    const shouldAutoMute = autoMuteOnExpire !== false;
+    const shouldAutoMute = isAutoMuteSpeakerForAssembly(targetAssembly);
 
     if (speakerTimerIntervals.has(targetAssembly)) {
       clearInterval(speakerTimerIntervals.get(targetAssembly));
       speakerTimerIntervals.delete(targetAssembly);
     }
 
-    // Al iniciar su tiempo de palabra, habilitarle automáticamente el micrófono
+    // Al iniciar el tiempo de palabra, habilitarle automáticamente el micrófono al orador
     if (cleanKey) {
       const map = getMediaPermissionsMapForAssembly(targetAssembly);
       const current = map.get(cleanKey) || { mic: false, cam: false };
@@ -2502,7 +2573,8 @@ io.on('connection', (socket) => {
       tiempoRestante: dur,
       targetKey: cleanKey,
       targetName: cleanName,
-      autoMuteOnExpire: shouldAutoMute
+      autoMuteOnExpire: shouldAutoMute,
+      justStarted: true
     };
 
     activeSpeakerTimers.set(targetAssembly, timerData);
@@ -2519,19 +2591,26 @@ io.on('connection', (socket) => {
       }
 
       currentTimer.tiempoRestante -= 1;
+      const restanteActual = Math.max(0, currentTimer.tiempoRestante);
+
       io.to(roomName).emit('speaker:timer_tick', {
-        tiempoRestante: Math.max(0, currentTimer.tiempoRestante),
+        tiempoRestante: restanteActual,
         duracion: currentTimer.duracion,
         targetKey: currentTimer.targetKey,
-        targetName: currentTimer.targetName
+        targetName: currentTimer.targetName,
+        autoMuteOnExpire: isAutoMuteSpeakerForAssembly(targetAssembly),
+        warn15: restanteActual === 15
       });
 
-      if (currentTimer.tiempoRestante <= 0) {
+      if (restanteActual <= 0) {
         clearInterval(interval);
         speakerTimerIntervals.delete(targetAssembly);
         currentTimer.isOpen = false;
 
-        if (currentTimer.autoMuteOnExpire && currentTimer.targetKey) {
+        // Evaluar la condición configurada a nivel de asamblea para cerrar o no el micrófono.
+        // NUNCA baja la mano automáticamente (eso lo hace el moderador manualmente).
+        const autoMuteAssemblySetting = isAutoMuteSpeakerForAssembly(targetAssembly);
+        if (autoMuteAssemblySetting && currentTimer.targetKey) {
           const map = getMediaPermissionsMapForAssembly(targetAssembly);
           const currentPerm = map.get(currentTimer.targetKey) || { mic: false, cam: false };
           currentPerm.mic = false;
@@ -2543,18 +2622,12 @@ io.on('connection', (socket) => {
             changedType: 'mic',
             allowed: false
           });
-
-          const handsQueue = getRaisedHandsForAssembly(targetAssembly);
-          const idx = handsQueue.findIndex(h => h.key === currentTimer.targetKey || String(h.userId).toUpperCase() === currentTimer.targetKey);
-          if (idx !== -1) {
-            handsQueue.splice(idx, 1);
-            io.to(roomName).emit('chat:hands_updated', { raisedHands: handsQueue });
-          }
         }
 
         io.to(roomName).emit('speaker:timer_expired', {
           targetKey: currentTimer.targetKey,
-          targetName: currentTimer.targetName
+          targetName: currentTimer.targetName,
+          micClosed: autoMuteAssemblySetting
         });
         activeSpeakerTimers.delete(targetAssembly);
       }
@@ -2574,6 +2647,7 @@ io.on('connection', (socket) => {
 
     const roomName = `assembly_${targetAssembly}`;
 
+    // Si el moderador oprime "Finalizar y Silenciar", cierra el micrófono pero NO baja la mano automáticamente
     if (muteUser && currentTimer && currentTimer.targetKey) {
       const map = getMediaPermissionsMapForAssembly(targetAssembly);
       const currentPerm = map.get(currentTimer.targetKey) || { mic: false, cam: false };
@@ -2586,13 +2660,6 @@ io.on('connection', (socket) => {
         changedType: 'mic',
         allowed: false
       });
-
-      const handsQueue = getRaisedHandsForAssembly(targetAssembly);
-      const idx = handsQueue.findIndex(h => h.key === currentTimer.targetKey || String(h.userId).toUpperCase() === currentTimer.targetKey);
-      if (idx !== -1) {
-        handsQueue.splice(idx, 1);
-        io.to(roomName).emit('chat:hands_updated', { raisedHands: handsQueue });
-      }
     }
 
     activeSpeakerTimers.delete(targetAssembly);
