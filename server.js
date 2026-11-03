@@ -1776,286 +1776,308 @@ app.delete('/api/questions/:id', async (req, res) => {
 // =========================================================================
 // INICIO SECCION 14: API REST - GESTION DE PODERES Y ACCIONES DIRECTAS EMAIL
 // =========================================================================
+// CONSULTAR TODOS LOS PODERES DE UNA ASAMBLEA
 app.get('/api/powers/:assemblyId', async (req, res) => {
   try {
     const { assemblyId } = req.params;
-    const [poderes] = await db.query(
-      `SELECT p.id, p.estado, p.documento_url, p.observaciones, p.created_at,
-              u_ot.id AS otorgante_num_id, u_ot.identificador_unico AS otorgante_id, u_ot.nombre_completo AS otorgante_nombre, u_ot.coeficiente AS otorgante_coef,
-              u_ap.id AS apoderado_num_id, u_ap.identificador_unico AS apoderado_id, u_ap.nombre_completo AS apoderado_nombre
+    const targetAssembly = parseInt(assemblyId) || 1;
+
+    const [rows] = await db.query(
+      `SELECT p.id, p.assembly_id, p.otorgante_id, p.apoderado_id, p.documento_url, p.estado, p.observaciones, p.created_at,
+              u_ot.identificador_unico AS otorgante_identificador, u_ot.nombre_completo AS otorgante_nombre, u_ot.unidad AS otorgante_unidad, u_ot.coeficiente AS otorgante_coeficiente,
+              u_ap.identificador_unico AS apoderado_identificador, u_ap.nombre_completo AS apoderado_nombre, u_ap.unidad AS apoderado_unidad
        FROM poderes p
        JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
        JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
        WHERE p.assembly_id = ?
-       ORDER BY p.created_at DESC`,
-      [assemblyId]
+       ORDER BY p.id DESC`,
+      [targetAssembly]
     );
 
-    for (let pod of poderes) {
-      pod.apoderado_coef_efectivo = await getUserEffectiveCoefficient(pod.apoderado_num_id, assemblyId);
-    }
-
-    res.json({ ok: true, poderes });
+    res.json({ ok: true, poderes: rows });
   } catch (err) {
+    console.error('Error consultando poderes:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.get('/api/powers/:id/quick-action', async (req, res) => {
+// RADICAR UN PODER (DESDE INDEX.HTML O ASIGNACIÓN MANUAL DESDE ADMIN.HTML)
+app.post('/api/powers', async (req, res) => {
   try {
-    const { id } = req.params;
-    const { status, token } = req.query;
+    const {
+      assemblyId,
+      otorganteUnico,
+      apoderadoUnico,
+      otorganteId,
+      apoderadoId,
+      documentoUrl,
+      estado,
+      isAdminAssign,
+      aprobadoPorAdmin,
+      manualAdmin
+    } = req.body;
 
-    if (!id || !status || !token) {
-      return res.status(400).send(renderResponseHTML('Error de Solicitud', 'Parámetros incompletos en el enlace.', false));
+    const targetAssembly = parseInt(assemblyId) || 1;
+    const esAsignacionManualAdmin = Boolean(isAdminAssign || aprobadoPorAdmin || manualAdmin || estado === 'autorizado');
+
+    // Validar si la recepción virtual de poderes por parte de los copropietarios está habilitada en la asamblea
+    if (!esAsignacionManualAdmin && !isAllowUserPowersForAssembly(targetAssembly)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'La radicación virtual de poderes está deshabilitada para esta asamblea (solo recepción presencial ante la administración).'
+      });
     }
 
-    const expectedToken = generatePowerActionToken(id, status);
-    if (token !== expectedToken) {
-      return res.status(403).send(renderResponseHTML('Enlace Inválido', 'El token de seguridad no es válido o ha expirado.', false));
+    // Buscar Otorgante
+    let otorganteRow = null;
+    if (otorganteId) {
+      const [r] = await db.query(`SELECT * FROM usuarios WHERE id = ? AND assembly_id = ? LIMIT 1`, [otorganteId, targetAssembly]);
+      if (r.length > 0) otorganteRow = r[0];
+    }
+    if (!otorganteRow && otorganteUnico) {
+      const cleanOt = String(otorganteUnico).trim().toUpperCase();
+      const [r] = await db.query(
+        `SELECT * FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ?) LIMIT 1`,
+        [targetAssembly, cleanOt, cleanOt]
+      );
+      if (r.length > 0) otorganteRow = r[0];
     }
 
-    const [podRows] = await db.query(
-      `SELECT p.id, p.assembly_id, p.estado, u_ot.nombre_completo AS otorgante, u_ap.nombre_completo AS apoderado 
-       FROM poderes p
-       JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
-       JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
-       WHERE p.id = ?`,
-      [id]
+    if (!otorganteRow) {
+      return res.status(404).json({ ok: false, error: 'No se encontró la unidad o copropietario otorgante en el padrón de esta asamblea.' });
+    }
+
+    // Buscar Apoderado
+    let apoderadoRow = null;
+    if (apoderadoId) {
+      const [r] = await db.query(`SELECT * FROM usuarios WHERE id = ? AND assembly_id = ? LIMIT 1`, [apoderadoId, targetAssembly]);
+      if (r.length > 0) apoderadoRow = r[0];
+    }
+    if (!apoderadoRow && apoderadoUnico) {
+      const cleanAp = String(apoderadoUnico).trim().toUpperCase();
+      const [r] = await db.query(
+        `SELECT * FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ?) LIMIT 1`,
+        [targetAssembly, cleanAp, cleanAp]
+      );
+      if (r.length > 0) apoderadoRow = r[0];
+    }
+
+    if (!apoderadoRow) {
+      return res.status(404).json({ ok: false, error: 'No se encontró el usuario apoderado en el padrón de esta asamblea.' });
+    }
+
+    if (parseInt(otorganteRow.id) === parseInt(apoderadoRow.id)) {
+      return res.status(400).json({ ok: false, error: 'Un copropietario no puede otorgarse un poder a sí mismo.' });
+    }
+
+    // Verificar que el otorgante no haya dado él mismo poder ya a otro o no sea ya apoderado en cadena si aplica
+    const estadoInicial = esAsignacionManualAdmin ? (estado || 'autorizado') : 'pendiente';
+    const docFinal = documentoUrl || null;
+
+    const [insertRes] = await db.query(
+      `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         apoderado_id = VALUES(apoderado_id),
+         documento_url = COALESCE(VALUES(documento_url), documento_url),
+         estado = VALUES(estado),
+         created_at = CURRENT_TIMESTAMP`,
+      [targetAssembly, otorganteRow.id, apoderadoRow.id, docFinal, estadoInicial]
     );
 
-    if (podRows.length === 0) {
-      return res.status(404).send(renderResponseHTML('No Encontrado', 'El poder especificado no existe.', false));
+    // obtener el ID real del registro de poder
+    let powerId = insertRes.insertId;
+    if (!powerId) {
+      const [existingRow] = await db.query(
+        `SELECT id FROM poderes WHERE assembly_id = ? AND otorgante_id = ? LIMIT 1`,
+        [targetAssembly, otorganteRow.id]
+      );
+      if (existingRow.length > 0) powerId = existingRow[0].id;
     }
 
-    const poder = podRows[0];
-    const nuevoEstado = status === 'autorizado' ? 'autorizado' : 'rechazado';
-    const observacion = `Procesado mediante acción directa desde correo electrónico el ${new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' })}`;
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('powers:updated');
+    await updateAndBroadcastQuorum(targetAssembly);
 
-    await db.query(`UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`, [nuevoEstado, observacion, id]);
+    // Si quedó en estado pendiente, enviar notificación por correo con botones rápidos de Aprobar / Rechazar al Representante Legal o Admin
+    if (estadoInicial === 'pendiente' && powerId) {
+      try {
+        const [asmRows] = await db.query(`SELECT nombre_copropiedad FROM asambleas WHERE id = ?`, [targetAssembly]);
+        const nombreCopropiedad = asmRows.length > 0 ? asmRows[0].nombre_copropiedad : `Asamblea #${targetAssembly}`;
 
-    await updateAndBroadcastQuorum(poder.assembly_id);
-    io.to(`assembly_${poder.assembly_id}`).emit('powers:updated');
+        const [destinatarios] = await db.query(
+          `SELECT email, nombre_completo, rol FROM usuarios 
+           WHERE assembly_id = ? AND rol IN ('representante_legal', 'administrador') AND email IS NOT NULL AND email != ''`,
+          [targetAssembly]
+        );
 
-    const colorHeader = nuevoEstado === 'autorizado' ? '#10b981' : '#ef4444';
-    const tituloResultado = nuevoEstado === 'autorizado' ? 'Poder Aprobado y Autorizado' : 'Poder Rechazado';
-    const mensajeDetalle = `El poder otorgado por <strong>${poder.otorgante}</strong> a favor de <strong>${poder.apoderado}</strong> ha sido marcado como <strong>${nuevoEstado.toUpperCase()}</strong> correctamente.`;
+        const listaCorreos = destinatarios.map(d => d.email.trim()).filter(Boolean);
+        if (listaCorreos.length > 0 && typeof createPowerActionToken === 'function') {
+          const backendBaseUrl = process.env.RENDER_EXTERNAL_URL || process.env.BACKEND_URL || `https://asambleas-backend.onrender.com`;
+          const tokenApprove = createPowerActionToken(powerId, 'autorizado');
+          const tokenReject = createPowerActionToken(powerId, 'rechazado');
 
-    return res.send(renderResponseHTML(tituloResultado, mensajeDetalle, true, colorHeader));
+          const urlApprove = `${backendBaseUrl}/api/powers/${powerId}/quick-action?action=autorizado&token=${encodeURIComponent(tokenApprove)}`;
+          const urlReject = `${backendBaseUrl}/api/powers/${powerId}/quick-action?action=rechazado&token=${encodeURIComponent(tokenReject)}`;
 
+          const attachments = [];
+          if (docFinal && typeof docFinal === 'string' && docFinal.startsWith('data:')) {
+            const match = docFinal.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+              const mimeType = match[1];
+              const base64Content = match[2];
+              const ext = mimeType.includes('pdf') ? 'pdf' : (mimeType.includes('png') ? 'png' : 'jpg');
+              attachments.push({
+                filename: `Poder_${otorganteRow.unidad}_a_${apoderadoRow.unidad}.${ext}`,
+                content: Buffer.from(base64Content, 'base64')
+              });
+            }
+          }
+
+          const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
+          await resend.emails.send({
+            from: `Control de Poderes <${fromSender}>`,
+            to: listaCorreos,
+            subject: `⚖️ Nuevo Poder Radicado (${otorganteRow.unidad} ➔ ${apoderadoRow.unidad}) - ${nombreCopropiedad}`,
+            html: `
+              <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 24px; border-radius: 12px; max-width: 600px; margin: auto;">
+                <h2 style="color: #fbbf24; margin-top: 0;">Solicitud de Aprobación de Poder</h2>
+                <p style="font-size: 14px; color: #e2e8f0;">Se ha radicado un nuevo poder en <strong>${nombreCopropiedad}</strong>:</p>
+                <div style="background-color: #1e293b; padding: 16px; border-radius: 8px; border-left: 4px solid #6366f1; margin: 16px 0; font-size: 13px; line-height: 1.6;">
+                  <p style="margin: 4px 0;"><strong>Otorgante (Quien cede el voto):</strong> ${otorganteRow.unidad} - ${otorganteRow.nombre_completo} (${otorganteRow.identificador_unico}) — Coef: <strong>${parseFloat(otorganteRow.coeficiente || 0).toFixed(4)}%</strong></p>
+                  <p style="margin: 4px 0;"><strong>Apoderado (Quien recibe el voto):</strong> ${apoderadoRow.unidad} - ${apoderadoRow.nombre_completo} (${apoderadoRow.identificador_unico})</p>
+                </div>
+                <p style="font-size: 13px; color: #cbd5e1;">Revisa el documento adjunto en este correo y autoriza o rechaza el poder con un solo clic:</p>
+                <div style="text-align: center; margin: 24px 0;">
+                  <a href="${urlApprove}" style="background-color: #10b981; color: #ffffff; padding: 12px 22px; text-decoration: none; font-weight: bold; border-radius: 8px; margin-right: 12px; display: inline-block;">✓ APROBAR PODER</a>
+                  <a href="${urlReject}" style="background-color: #ef4444; color: #ffffff; padding: 12px 22px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">✕ RECHAZAR PODER</a>
+                </div>
+              </div>
+            `,
+            attachments
+          });
+        }
+      } catch (emailErr) {
+        console.warn('Aviso al enviar email de notificación de poder:', emailErr.message);
+      }
+    }
+
+    res.json({
+      ok: true,
+      powerId,
+      estado: estadoInicial,
+      message: estadoInicial === 'autorizado'
+        ? 'Poder registrado y autorizado directamente.'
+        : 'Poder enviado correctamente para revisión del Representante Legal.'
+    });
   } catch (err) {
-    console.error('Error en quick-action poder:', err);
-    return res.status(500).send(renderResponseHTML('Error Interno', 'No se pudo procesar la solicitud.', false));
+    console.error('Error registrando poder:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.put('/api/powers/:id/status', async (req, res) => {
+// APROBAR O RECHAZAR UN PODER DESDE ADMIN.HTML
+app.put('/api/powers/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { estado, observaciones } = req.body;
-    const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
-    if (p.length === 0) return res.status(404).json({ ok: false, error: 'Poder no encontrado' });
 
-    await db.query(`UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`, [estado, observaciones || '', id]);
+    if (!['autorizado', 'rechazado', 'pendiente'].includes(estado)) {
+      return res.status(400).json({ ok: false, error: 'Estado de poder inválido.' });
+    }
 
-    const targetAssembly = p[0].assembly_id;
+    const [rows] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Registro de poder no encontrado.' });
+    }
+
+    const targetAssembly = parseInt(rows[0].assembly_id) || 1;
+
+    await db.query(
+      `UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`,
+      [estado, observaciones || null, id]
+    );
+
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('powers:updated');
     await updateAndBroadcastQuorum(targetAssembly);
-    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
-    res.json({ ok: true, message: `Poder ${estado} correctamente.` });
+
+    res.json({ ok: true, message: `Poder actualizado a estado: ${estado.toUpperCase()}.` });
   } catch (err) {
+    console.error('Error actualizando poder:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
+// ELIMINAR UN PODER DESDE ADMIN.HTML
 app.delete('/api/powers/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const [p] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
-    if (p.length === 0) return res.status(404).json({ ok: false, error: 'Poder no encontrado' });
+    const [rows] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Poder no encontrado.' });
+    }
 
-    const targetAssembly = p[0].assembly_id;
+    const targetAssembly = parseInt(rows[0].assembly_id) || 1;
     await db.query(`DELETE FROM poderes WHERE id = ?`, [id]);
 
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('powers:updated');
     await updateAndBroadcastQuorum(targetAssembly);
-    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
+
     res.json({ ok: true, message: 'Poder eliminado correctamente.' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.post('/api/powers/manual', async (req, res) => {
+// ACCIÓN RÁPIDA DESDE EL CORREO ELECTRÓNICO (APROBAR O RECHAZAR EN UN CLIC CON TOKEN HMAC)
+app.get('/api/powers/:id/quick-action', async (req, res) => {
   try {
-    const { assemblyId, otorganteId, apoderadoIdentificador, apoderadoNombre } = req.body;
-    const targetAssembly = parseInt(assemblyId) || 1;
-    const cleanOtorgante = (otorganteId || '').toString().trim().toUpperCase();
-    const cleanApoderado = (apoderadoIdentificador || '').toString().trim().toUpperCase();
+    const { id } = req.params;
+    const { action, token } = req.query;
 
-    if (!cleanOtorgante || !cleanApoderado) {
-      return res.status(400).json({ ok: false, error: 'Identificador del otorgante y del apoderado son requeridos.' });
+    if (!['autorizado', 'rechazado'].includes(action)) {
+      return res.status(400).send(buildQuickActionResultHTML('Acción Inválida', 'El enlace no contiene una acción válida.', '#ef4444'));
     }
 
-    let [otorganteRows] = await db.query(
-      `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
-      [targetAssembly, cleanOtorgante, cleanOtorgante, parseInt(cleanOtorgante) || 0]
+    if (typeof verifyPowerActionToken === 'function' && !verifyPowerActionToken(id, action, token)) {
+      return res.status(403).send(buildQuickActionResultHTML('Enlace No Válido o Expirado', 'La firma de seguridad del enlace no coincide.', '#ef4444'));
+    }
+
+    const [rows] = await db.query(
+      `SELECT p.id, p.assembly_id, p.estado,
+              u_ot.unidad AS otorgante_unidad, u_ot.nombre_completo AS otorgante_nombre,
+              u_ap.unidad AS apoderado_unidad, u_ap.nombre_completo AS apoderado_nombre
+       FROM poderes p
+       JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
+       JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
+       WHERE p.id = ? LIMIT 1`,
+      [id]
     );
 
-    if (otorganteRows.length === 0) {
-      return res.status(404).json({ ok: false, error: `El inmueble/otorgante [${cleanOtorgante}] no fue encontrado en la base de datos.` });
+    if (rows.length === 0) {
+      return res.status(404).send(buildQuickActionResultHTML('Poder No Encontrado', 'Este poder ya no existe en el sistema.', '#f59e0b'));
     }
 
-    const otorganteNumId = otorganteRows[0].id;
+    const poder = rows[0];
+    const targetAssembly = parseInt(poder.assembly_id) || 1;
 
-    let [apoderadoRows] = await db.query(
-      `SELECT id FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?)`,
-      [targetAssembly, cleanApoderado, cleanApoderado, parseInt(cleanApoderado) || 0]
-    );
+    await db.query(`UPDATE poderes SET estado = ? WHERE id = ?`, [action, id]);
 
-    let apoderadoNumId;
-    if (apoderadoRows.length === 0) {
-      const [ins] = await db.query(
-        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
-         VALUES (?, ?, ?, 'Apoderado Externo', 0.00000, 'asistente')`,
-        [targetAssembly, cleanApoderado, apoderadoNombre || cleanApoderado]
-      );
-      apoderadoNumId = ins.insertId;
-    } else {
-      apoderadoNumId = apoderadoRows[0].id;
-    }
-
-    if (otorganteNumId === apoderadoNumId) {
-      return res.status(400).json({ ok: false, error: 'El otorgante y el apoderado no pueden ser la misma persona.' });
-    }
-
-    await db.query(
-      `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado, observaciones)
-       VALUES (?, ?, ?, 'ASIGNACIÓN DIRECTA ADMIN', 'autorizado', 'Asignado manualmente por Representante/Admin')
-       ON DUPLICATE KEY UPDATE apoderado_id = VALUES(apoderado_id), estado = 'autorizado'`,
-      [targetAssembly, otorganteNumId, apoderadoNumId]
-    );
-
+    const roomName = `assembly_${targetAssembly}`;
+    io.to(roomName).emit('powers:updated');
     await updateAndBroadcastQuorum(targetAssembly);
-    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
-    res.json({ ok: true, message: 'Poder asignado y autorizado correctamente.' });
+
+    const esAprobado = action === 'autorizado';
+    const titulo = esAprobado ? '✅ Poder Aprobado Exitosamente' : '❌ Poder Rechazado';
+    const color = esAprobado ? '#10b981' : '#ef4444';
+    const detalle = `El poder de <strong>${poder.otorgante_unidad} (${poder.otorgante_nombre})</strong> otorgado a <strong>${poder.apoderado_unidad} (${poder.apoderado_nombre})</strong> ha quedado registrado como <strong>${action.toUpperCase()}</strong> y el coeficiente se ha actualizado en tiempo real.`;
+
+    return res.send(buildQuickActionResultHTML(titulo, detalle, color));
   } catch (err) {
-    console.error('Error en asignar poder manual:', err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.post('/api/powers', async (req, res) => {
-  try {
-    const { assemblyId, otorganteUnico, apoderadoUnico, documentoUrl } = req.body;
-    const targetAssembly = parseInt(assemblyId) || 1;
-    const cleanOtorgante = (otorganteUnico || '').toString().trim().toUpperCase();
-    const cleanApoderado = (apoderadoUnico || '').toString().trim().toUpperCase();
-
-    const [otorgantes] = await db.query(
-      `SELECT id, nombre_completo, unidad FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-      [targetAssembly, cleanOtorgante]
-    );
-    const [apoderados] = await db.query(
-      `SELECT id, nombre_completo, unidad FROM usuarios WHERE assembly_id = ? AND UPPER(identificador_unico) = ?`,
-      [targetAssembly, cleanApoderado]
-    );
-
-    if (otorgantes.length === 0) return res.status(400).json({ ok: false, error: 'El otorgante no existe.' });
-    if (apoderados.length === 0) return res.status(400).json({ ok: false, error: 'El apoderado no existe.' });
-
-    const otorganteUser = otorgantes[0];
-    const apoderadoUser = apoderados[0];
-
-    const [resultPoder] = await db.query(
-      `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado) VALUES (?, ?, ?, ?, 'pendiente')`,
-      [targetAssembly, otorganteUser.id, apoderadoUser.id, documentoUrl]
-    );
-
-    const powerId = resultPoder.insertId;
-    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
-
-    try {
-      const [reps] = await db.query(
-        `SELECT email, nombre_completo FROM usuarios 
-         WHERE assembly_id = ? AND rol IN ('representante_legal', 'administrador') AND email IS NOT NULL AND email != ''`,
-        [targetAssembly]
-      );
-
-      const [asamblea] = await db.query(`SELECT nombre_copropiedad FROM asambleas WHERE id = ?`, [targetAssembly]);
-      const nombreCopropiedad = asamblea.length > 0 ? asamblea[0].nombre_copropiedad : 'Asamblea Virtual';
-
-      if (reps.length > 0) {
-        const emailsDestino = reps.map(r => r.email);
-        const fromSender = process.env.RESEND_FROM_EMAIL || 'contacto@ajaudiovisual.com';
-        const serverBaseUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
-
-        const tokenApprove = generatePowerActionToken(powerId, 'autorizado');
-        const tokenReject = generatePowerActionToken(powerId, 'rechazado');
-
-        const approveLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=autorizado&token=${tokenApprove}`;
-        const rejectLink = `${serverBaseUrl}/api/powers/${powerId}/quick-action?status=rechazado&token=${tokenReject}`;
-
-        let attachments = [];
-        if (documentoUrl && documentoUrl.startsWith('data:')) {
-          const matches = documentoUrl.match(/^data:(.+);base64,(.+)$/);
-          if (matches) {
-            const mimeType = matches[1];
-            const base64Content = matches[2];
-            let ext = 'pdf';
-            if (mimeType.includes('png')) ext = 'png';
-            else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) ext = 'jpg';
-
-            attachments.push({
-              filename: `Poder_${cleanOtorgante}_a_${cleanApoderado}.${ext}`,
-              content: Buffer.from(base64Content, 'base64')
-            });
-          }
-        }
-
-        await resend.emails.send({
-          from: `${nombreCopropiedad} <${fromSender}>`,
-          to: emailsDestino,
-          subject: `🚨 Alerta: Nuevo Poder Pendiente por Autorizar - ${nombreCopropiedad}`,
-          text: `Atención Representante Legal, se ha recibido un nuevo poder pendiente por aprobación.\nOtorgante: ${otorganteUser.nombre_completo} (${otorganteUser.unidad})\nApoderado: ${apoderadoUser.nombre_completo} (${apoderadoUser.unidad})\nAprobar: ${approveLink}\nRechazar: ${rejectLink}`,
-          html: `
-            <div style="font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 25px; border-radius: 12px; max-width: 600px; margin: auto;">
-              <h2 style="color: #f59e0b; text-align: center; margin-bottom: 20px;">⚠️ Nuevo Poder Pendiente de Autorización</h2>
-              <p style="font-size: 14px; line-height: 1.6;">Estimado(a) Representante Legal / Administrador,</p>
-              <p style="font-size: 14px; line-height: 1.6;">Se ha radicado una solicitud de poder en la plataforma para la copropiedad <strong>${nombreCopropiedad}</strong>.</p>
-              
-              <div style="background-color: #1e293b; padding: 18px; border-radius: 8px; border-left: 4px solid #f59e0b; margin: 20px 0;">
-                <p style="margin: 6px 0; font-size: 14px;"><strong>Otorgante:</strong> ${otorganteUser.nombre_completo} (Unidad: ${otorganteUser.unidad})</p>
-                <p style="margin: 6px 0; font-size: 14px;"><strong>Apoderado:</strong> ${apoderadoUser.nombre_completo} (Unidad: ${apoderadoUser.unidad})</p>
-                <p style="margin: 6px 0; font-size: 14px;"><strong>Estado:</strong> <span style="color: #f59e0b; font-weight: bold;">PENDIENTE DE REVISIÓN</span></p>
-              </div>
-
-              <div style="text-align: center; margin: 25px 0;">
-                <a href="${approveLink}" target="_blank" style="background-color: #10b981; color: #ffffff; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block; margin-right: 10px; font-size: 14px;">
-                  ✓ APROBAR PODER
-                </a>
-                <a href="${rejectLink}" target="_blank" style="background-color: #ef4444; color: #ffffff; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block; font-size: 14px;">
-                  ✕ RECHAZAR PODER
-                </a>
-              </div>
-
-              <p style="font-size: 12px; color: #cbd5e1; line-height: 1.6; text-align: center;">
-                El documento adjunto se encuentra disponible en este correo. Puede hacer clic en cualquiera de los botones superiores para autorizar o rechazar este poder de manera inmediata.
-              </p>
-
-              <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">
-                Notificación automática del Sistema de Asambleas Virtuales.
-              </p>
-            </div>
-          `,
-          attachments: attachments
-        });
-      }
-    } catch (emailErr) {
-      console.error('Error al enviar correo de alerta de poder al representante:', emailErr);
-    }
-
-    res.json({ ok: true, message: 'Poder registrado exitosamente y notificación enviada al representante legal.' });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    console.error('Error en quick-action de poder:', err);
+    return res.status(500).send(buildQuickActionResultHTML('Error del Servidor', err.message, '#ef4444'));
   }
 });
 // =========================================================================
