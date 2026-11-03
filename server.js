@@ -1547,8 +1547,8 @@ app.post('/api/superadmin/send-credentials', async (req, res) => {
   }
 });
 
-// ENVÍO INDIVIDUAL DE CREDENCIAL CON CONTRASEÑA NUMÉRICA
-app.post('/api/superadmin/users/send-single-credential', async (req, res) => {
+// ENVÍO INDIVIDUAL DE CREDENCIAL CON CONTRASEÑA NUMÉRICA (COMPATIBILIDAD DE RUTAS)
+app.post(['/api/superadmin/users/send-single-credential', '/api/superadmin/send-single-credential'], async (req, res) => {
   try {
     const { userId, customPassword } = req.body;
     if (!userId) return res.status(400).json({ ok: false, error: 'ID de usuario requerido.' });
