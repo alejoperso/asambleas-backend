@@ -807,60 +807,76 @@ app.get('/api/superadmin/admin-users', async (req, res) => {
 
 app.post('/api/superadmin/admin-users', async (req, res) => {
   try {
-    const { assemblyId, nombreCompleto, email, password, rol } = req.body;
+    const { assemblyId, nombreCompleto, nombre, email, correo, password, clave, rol, role } = req.body;
 
-    if (!email || !rol) {
-      return res.status(400).json({ ok: false, error: 'Correo y rol son obligatorios.' });
+    const rawEmail = (email || correo || '').toString().trim().toLowerCase();
+    const rawRol = (rol || role || 'moderador').toString().trim().toLowerCase();
+    const rawPass = (password !== undefined ? password : (clave !== undefined ? clave : '')).toString().trim();
+    const cleanName = (nombreCompleto || nombre || 'Usuario Gestión').toString().trim();
+
+    if (!rawEmail) {
+      return res.status(400).json({ ok: false, error: 'El correo electrónico es obligatorio.' });
     }
 
-    const validRoles = ['administrador', 'soporte', 'moderador', 'representante_legal'];
-    if (!validRoles.includes(rol)) {
-      return res.status(400).json({ ok: false, error: 'Rol no válido.' });
-    }
-
-    const cleanEmail = email.trim().toLowerCase();
-    const cleanName = (nombreCompleto || 'Usuario Gestión').trim();
+    const roleMap = {
+      'administrador': 'administrador',
+      'admin': 'administrador',
+      'moderador': 'moderador',
+      'operador': 'moderador',
+      'representante_legal': 'representante_legal',
+      'representante': 'representante_legal',
+      'soporte': 'soporte'
+    };
+    const finalRol = roleMap[rawRol] || 'moderador';
     const targetAssembly = parseInt(assemblyId) || 1;
-    const identificadorUnico = `${rol.toUpperCase()}-${Date.now().toString().slice(-4)}`;
 
     let hashedPassword = null;
-    if (password && password.trim() !== '') {
+    if (rawPass !== '') {
       const salt = await bcrypt.genSalt(10);
-      hashedPassword = await bcrypt.hash(password.trim(), salt);
+      hashedPassword = await bcrypt.hash(rawPass, salt);
     } else {
-      const [existing] = await db.query(
+      const [existingPass] = await db.query(
         `SELECT password FROM usuarios WHERE LOWER(email) = ? AND password IS NOT NULL AND password != '' ORDER BY id DESC LIMIT 1`,
-        [cleanEmail]
+        [rawEmail]
       );
-      if (existing.length > 0) {
-        hashedPassword = existing[0].password;
+      if (existingPass.length > 0) {
+        hashedPassword = existingPass[0].password;
+      } else {
+        const autoPlain = generateAlphanumericPassword(6);
+        const salt = await bcrypt.genSalt(10);
+        hashedPassword = await bcrypt.hash(autoPlain, salt);
       }
     }
 
-    if (hashedPassword) {
+    // Verificar si ya existe un registro con ese correo en esa misma asamblea
+    const [existingInAssembly] = await db.query(
+      `SELECT id, identificador_unico FROM usuarios WHERE assembly_id = ? AND LOWER(email) = ? LIMIT 1`,
+      [targetAssembly, rawEmail]
+    );
+
+    if (existingInAssembly.length > 0) {
+      await db.query(
+        `UPDATE usuarios 
+         SET nombre_completo = ?, password = ?, rol = ?, unidad = 'GESTIÓN' 
+         WHERE id = ?`,
+        [cleanName, hashedPassword, finalRol, existingInAssembly[0].id]
+      );
+    } else {
+      const identificadorUnico = `${finalRol.toUpperCase()}-${Date.now().toString().slice(-5)}`;
       await db.query(
         `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
          VALUES (?, ?, ?, 'GESTIÓN', ?, ?, 0.00000, ?)
          ON DUPLICATE KEY UPDATE 
            nombre_completo = VALUES(nombre_completo),
+           email = VALUES(email),
            password = VALUES(password),
            rol = VALUES(rol),
            assembly_id = VALUES(assembly_id)`,
-        [targetAssembly, identificadorUnico, cleanName, cleanEmail, hashedPassword, rol]
-      );
-    } else {
-      await db.query(
-        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol)
-         VALUES (?, ?, ?, 'GESTIÓN', ?, '', 0.00000, ?)
-         ON DUPLICATE KEY UPDATE 
-           nombre_completo = VALUES(nombre_completo),
-           rol = VALUES(rol),
-           assembly_id = VALUES(assembly_id)`,
-        [targetAssembly, identificadorUnico, cleanName, cleanEmail, rol]
+        [targetAssembly, identificadorUnico, cleanName, rawEmail, hashedPassword, finalRol]
       );
     }
 
-    res.json({ ok: true, message: `Usuario con rol [${rol}] guardado correctamente.` });
+    res.json({ ok: true, message: `Usuario con rol [${finalRol.toUpperCase()}] guardado correctamente.` });
   } catch (err) {
     console.error('Error al crear/actualizar admin user:', err);
     res.status(500).json({ ok: false, error: err.message });
