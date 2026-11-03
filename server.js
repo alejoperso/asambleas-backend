@@ -43,6 +43,7 @@ const socketUserMap = new Map();
 const activeSpeakerTimers = new Map();
 const speakerTimerIntervals = new Map();
 const assemblySpeakerAutoMute = new Map(); // Configuración a nivel de asamblea: true = cierra mic al terminar tiempo, false = mantiene mic abierto
+const assemblyAllowUserPowers = new Map(); // Configuración a nivel de asamblea: true = usuarios pueden radicar poderes, false = solo presencial/admin
 
 // ESTRUCTURAS EN MEMORIA PARA MODERACIÓN AVANZADA DEL CHAT, MANOS LEVANTADAS, COMPUERTA ZOOM Y PERMISOS DE AUDIO/VIDEO
 const assemblyChatActive = new Map(); // Pausa global del chat por asamblea
@@ -99,6 +100,14 @@ function isAutoMuteSpeakerForAssembly(assemblyId) {
     assemblySpeakerAutoMute.set(target, true);
   }
   return assemblySpeakerAutoMute.get(target) === true;
+}
+
+function isAllowUserPowersForAssembly(assemblyId) {
+  const target = parseInt(assemblyId) || 1;
+  if (!assemblyAllowUserPowers.has(target)) {
+    assemblyAllowUserPowers.set(target, true);
+  }
+  return assemblyAllowUserPowers.get(target) === true;
 }
 // =========================================================================
 // FIN SECCION 02: ESTRUCTURAS EN MEMORIA Y HELPERS AUXILIARES
@@ -251,7 +260,7 @@ function renderResponseHTML(title, message, isSuccess, headerColor = '#6366f1') 
 // =========================================================================
 // INICIO SECCION 05: MIGRACION AUTOMATICA DE BASE DE DATOS (ESQUEMA SQL)
 // =========================================================================
-// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA COMPLETO (7 TABLAS DE SISTEMA + HÁBEAS DATA LEY 1581)
+// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA COMPLETO (7 TABLAS DE SISTEMA + HÁBEAS DATA + CONFIG PODERES)
 async function initDbSchema() {
   try {
     await db.query(`
@@ -266,6 +275,7 @@ async function initDbSchema() {
         zoom_password VARCHAR(100) NULL,
         zoom_habilitado TINYINT(1) DEFAULT 0,
         auto_mute_speaker TINYINT(1) DEFAULT 1,
+        allow_user_powers TINYINT(1) DEFAULT 1,
         politica_datos_texto LONGTEXT NULL,
         fecha_evento DATE NULL,
         hora_inicio DATETIME NULL,
@@ -373,6 +383,7 @@ async function initDbSchema() {
       `ALTER TABLE asambleas MODIFY COLUMN zoom_embed_url LONGTEXT NULL`,
       `ALTER TABLE asambleas ADD COLUMN zoom_habilitado TINYINT(1) DEFAULT 0`,
       `ALTER TABLE asambleas ADD COLUMN auto_mute_speaker TINYINT(1) DEFAULT 1`,
+      `ALTER TABLE asambleas ADD COLUMN allow_user_powers TINYINT(1) DEFAULT 1`,
       `ALTER TABLE asambleas ADD COLUMN politica_datos_texto LONGTEXT NULL`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
@@ -385,15 +396,16 @@ async function initDbSchema() {
     }
 
     try {
-      const [asmRows] = await db.query(`SELECT id, zoom_habilitado, auto_mute_speaker FROM asambleas`);
+      const [asmRows] = await db.query(`SELECT id, zoom_habilitado, auto_mute_speaker, allow_user_powers FROM asambleas`);
       asmRows.forEach(r => {
         const idNum = parseInt(r.id);
         assemblyZoomOpen.set(idNum, r.zoom_habilitado === 1);
         assemblySpeakerAutoMute.set(idNum, r.auto_mute_speaker !== 0);
+        assemblyAllowUserPowers.set(idNum, r.allow_user_powers !== 0);
       });
     } catch (e) {}
 
-    console.log('✅ Verificación y migración completa de las tablas de base de datos (incluyendo Hábeas Data).');
+    console.log('✅ Verificación y migración completa de las tablas de base de datos (incluyendo Hábeas Data y Config Poderes).');
   } catch (err) {
     console.warn('Advertencia en verificación de esquema:', err.message);
   }
@@ -432,31 +444,47 @@ function parseZoomCredentials(rawUrl, manualPasscode) {
 // =========================================================================
 // FIN SECCION 05: MIGRACION AUTOMATICA DE BASE DE DATOS (ESQUEMA SQL)
 // =========================================================================
-
 // =========================================================================
 // INICIO SECCION 06: LOGICA DE NEGOCIO (ZOOM, PODERES, QUORUM Y COEFICIENTES)
 // =========================================================================
 async function getAssemblyZoomStreamInfo(assemblyId) {
   const target = parseInt(assemblyId) || 1;
   try {
-    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_habilitado, auto_mute_speaker FROM asambleas WHERE id = ?`, [target]);
+    const [rows] = await db.query(`SELECT zoom_embed_url, zoom_meeting_id, zoom_passcode, zoom_habilitado, auto_mute_speaker, allow_user_powers FROM asambleas WHERE id = ?`, [target]);
     if (rows.length === 0) {
-      return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: false, autoMuteSpeaker: isAutoMuteSpeakerForAssembly(target) };
+      return {
+        rawUrl: '',
+        meetingId: '',
+        passcode: '',
+        zoomHabilitado: false,
+        autoMuteSpeaker: isAutoMuteSpeakerForAssembly(target),
+        allowUserPowers: isAllowUserPowersForAssembly(target)
+      };
     }
     const parsed = parseZoomCredentials(rows[0].zoom_embed_url, rows[0].zoom_passcode);
     const isEnabled = assemblyZoomOpen.has(target) ? assemblyZoomOpen.get(target) : (rows[0].zoom_habilitado === 1);
     const isAutoMute = assemblySpeakerAutoMute.has(target) ? assemblySpeakerAutoMute.get(target) : (rows[0].auto_mute_speaker !== 0);
+    const isAllowPowers = assemblyAllowUserPowers.has(target) ? assemblyAllowUserPowers.get(target) : (rows[0].allow_user_powers !== 0);
     assemblyZoomOpen.set(target, !!isEnabled);
     assemblySpeakerAutoMute.set(target, !!isAutoMute);
+    assemblyAllowUserPowers.set(target, !!isAllowPowers);
     return {
       rawUrl: rows[0].zoom_embed_url || '',
       meetingId: rows[0].zoom_meeting_id || parsed.meetingId,
       passcode: rows[0].zoom_passcode || parsed.passcode,
       zoomHabilitado: !!isEnabled,
-      autoMuteSpeaker: !!isAutoMute
+      autoMuteSpeaker: !!isAutoMute,
+      allowUserPowers: !!isAllowPowers
     };
   } catch (err) {
-    return { rawUrl: '', meetingId: '', passcode: '', zoomHabilitado: isZoomGateOpenForAssembly(target), autoMuteSpeaker: isAutoMuteSpeakerForAssembly(target) };
+    return {
+      rawUrl: '',
+      meetingId: '',
+      passcode: '',
+      zoomHabilitado: isZoomGateOpenForAssembly(target),
+      autoMuteSpeaker: isAutoMuteSpeakerForAssembly(target),
+      allowUserPowers: isAllowUserPowersForAssembly(target)
+    };
   }
 }
 
@@ -2230,7 +2258,8 @@ app.get('/api/assemblies/:id/zoom', async (req, res) => {
           meetingId: '',
           passcode: '',
           zoomHabilitado: false,
-          autoMuteSpeaker: streamInfo.autoMuteSpeaker
+          autoMuteSpeaker: streamInfo.autoMuteSpeaker,
+          allowUserPowers: streamInfo.allowUserPowers
         }
       });
     }
@@ -2310,6 +2339,35 @@ app.put('/api/assemblies/:id/speaker-config', async (req, res) => {
     res.json({
       ok: true,
       autoMuteSpeaker: isAutoMute
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// CONFIGURACIÓN A NIVEL DE ASAMBLEA: HABILITAR O DESACTIVAR CARGA DE PODERES POR USUARIOS
+app.put('/api/assemblies/:id/powers-config', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const targetAssembly = parseInt(id) || 1;
+    const { allowUserPowers } = req.body;
+    const isAllowed = !!allowUserPowers;
+
+    assemblyAllowUserPowers.set(targetAssembly, isAllowed);
+    try {
+      await db.query(`UPDATE asambleas SET allow_user_powers = ? WHERE id = ?`, [isAllowed ? 1 : 0, targetAssembly]);
+    } catch (e) {}
+
+    io.to(`assembly_${targetAssembly}`).emit('powers:config_updated', {
+      allowUserPowers: isAllowed
+    });
+
+    res.json({
+      ok: true,
+      allowUserPowers: isAllowed,
+      message: isAllowed
+        ? 'Carga virtual de poderes HABILITADA para los copropietarios.'
+        : 'Carga virtual de poderes DESACTIVADA (Modo Presencial / Solo Administración).'
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -2492,6 +2550,10 @@ io.on('connection', (socket) => {
 
       socket.emit('speaker:config_updated', {
         autoMuteSpeaker: isAutoMuteSpeakerForAssembly(targetAssembly)
+      });
+
+      socket.emit('powers:config_updated', {
+        allowUserPowers: isAllowUserPowersForAssembly(targetAssembly)
       });
 
       if (activeSpeakerTimers.has(targetAssembly)) {
