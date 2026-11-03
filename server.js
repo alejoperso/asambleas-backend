@@ -1321,6 +1321,47 @@ app.post('/api/superadmin/assign-role', async (req, res) => {
 // =========================================================================
 // INICIO SECCION 10: API REST - PADRON ELECTORAL, EDICION Y CREDENCIALES (RESEND)
 // =========================================================================
+app.post('/api/superadmin/upload-users', async (req, res) => {
+  try {
+    const { assemblyId, usuarios } = req.body;
+    const targetAssembly = parseInt(assemblyId) || 1;
+
+    if (!Array.isArray(usuarios) || usuarios.length === 0) {
+      return res.status(400).json({ ok: false, error: 'No se recibieron usuarios para cargar.' });
+    }
+
+    let count = 0;
+    for (const u of usuarios) {
+      const idUnico = String(u.identificadorUnico || u.id || '').trim().toUpperCase();
+      const nombre = String(u.nombreCompleto || u.nombre || 'Propietario').trim();
+      const unidad = String(u.unidad || idUnico).trim();
+      const email = String(u.email || '').trim().toLowerCase();
+      const coef = parseFloat(u.coeficiente) || 0;
+
+      if (!idUnico) continue;
+
+      await db.query(
+        `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol)
+         VALUES (?, ?, ?, ?, ?, ?, 'asistente')
+         ON DUPLICATE KEY UPDATE
+           nombre_completo = VALUES(nombre_completo),
+           unidad = VALUES(unidad),
+           email = VALUES(email),
+           coeficiente = VALUES(coeficiente)`,
+        [targetAssembly, idUnico, nombre, unidad, email, coef]
+      );
+      count++;
+    }
+
+    io.to(`assembly_${targetAssembly}`).emit('powers:updated');
+    io.to(`assembly_${targetAssembly}`).emit('users:updated');
+    res.json({ ok: true, message: `Se cargaron e insertaron ${count} copropietarios en el padrón con éxito.` });
+  } catch (err) {
+    console.error('Error en carga masiva de padrón:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/superadmin/users/bulk', async (req, res) => {
   try {
     const { assemblyId, users } = req.body;
@@ -1392,6 +1433,26 @@ app.put('/api/superadmin/users/:id', async (req, res) => {
     res.json({ ok: true, message: 'Usuario actualizado correctamente.' });
   } catch (err) {
     console.error('Error actualizando usuario del padrón:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/superadmin/users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [userRow] = await db.query(`SELECT assembly_id FROM usuarios WHERE id = ?`, [id]);
+    
+    await db.query(`DELETE FROM usuarios WHERE id = ?`, [id]);
+    
+    if (userRow.length > 0) {
+      const assemblyId = userRow[0].assembly_id;
+      await updateAndBroadcastQuorum(assemblyId);
+      io.to(`assembly_${assemblyId}`).emit('users:updated');
+    }
+
+    res.json({ ok: true, message: 'Usuario eliminado del padrón correctamente.' });
+  } catch (err) {
+    console.error('Error eliminando usuario del padrón:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
