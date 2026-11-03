@@ -251,7 +251,7 @@ function renderResponseHTML(title, message, isSuccess, headerColor = '#6366f1') 
 // =========================================================================
 // INICIO SECCION 05: MIGRACION AUTOMATICA DE BASE DE DATOS (ESQUEMA SQL)
 // =========================================================================
-// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA COMPLETO (7 TABLAS DE SISTEMA)
+// MIGRACIÓN AUTOMÁTICA SEGURA DE ESQUEMA COMPLETO (7 TABLAS DE SISTEMA + HÁBEAS DATA LEY 1581)
 async function initDbSchema() {
   try {
     await db.query(`
@@ -266,6 +266,7 @@ async function initDbSchema() {
         zoom_password VARCHAR(100) NULL,
         zoom_habilitado TINYINT(1) DEFAULT 0,
         auto_mute_speaker TINYINT(1) DEFAULT 1,
+        politica_datos_texto LONGTEXT NULL,
         fecha_evento DATE NULL,
         hora_inicio DATETIME NULL,
         hora_cierre DATETIME NULL,
@@ -285,6 +286,8 @@ async function initDbSchema() {
         coeficiente DECIMAL(10,5) DEFAULT 0.00000,
         rol VARCHAR(50) NOT NULL DEFAULT 'asistente',
         estado VARCHAR(20) DEFAULT 'activo',
+        acepta_habeas_data TINYINT(1) DEFAULT 0,
+        fecha_habeas_data DATETIME NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY idx_assembly_user (assembly_id, identificador_unico)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -363,11 +366,14 @@ async function initDbSchema() {
 
     const alterQueries = [
       `ALTER TABLE usuarios MODIFY COLUMN rol VARCHAR(50) NOT NULL DEFAULT 'asistente'`,
+      `ALTER TABLE usuarios ADD COLUMN acepta_habeas_data TINYINT(1) DEFAULT 0`,
+      `ALTER TABLE usuarios ADD COLUMN fecha_habeas_data DATETIME NULL`,
       `ALTER TABLE asambleas MODIFY COLUMN logo_url LONGTEXT NULL`,
       `ALTER TABLE asambleas MODIFY COLUMN estado VARCHAR(50) DEFAULT 'programada'`,
       `ALTER TABLE asambleas MODIFY COLUMN zoom_embed_url LONGTEXT NULL`,
       `ALTER TABLE asambleas ADD COLUMN zoom_habilitado TINYINT(1) DEFAULT 0`,
       `ALTER TABLE asambleas ADD COLUMN auto_mute_speaker TINYINT(1) DEFAULT 1`,
+      `ALTER TABLE asambleas ADD COLUMN politica_datos_texto LONGTEXT NULL`,
       `ALTER TABLE asambleas ADD COLUMN fecha_evento DATE NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_inicio DATETIME NULL`,
       `ALTER TABLE asambleas ADD COLUMN hora_cierre DATETIME NULL`
@@ -387,7 +393,7 @@ async function initDbSchema() {
       });
     } catch (e) {}
 
-    console.log('✅ Verificación y migración completa de las 7 tablas de base de datos.');
+    console.log('✅ Verificación y migración completa de las tablas de base de datos (incluyendo Hábeas Data).');
   } catch (err) {
     console.warn('Advertencia en verificación de esquema:', err.message);
   }
@@ -548,7 +554,8 @@ async function computeQuorumAndConnected(assemblyId) {
         nombreCompleto: session.nombreCompleto,
         unidad: session.unidad,
         rol: session.rol,
-        coeficiente: coefEfectivo
+        coeficiente: coefEfectivo,
+        aceptaHabeasData: !!session.aceptaHabeasData
       });
     }
   }
@@ -2304,7 +2311,7 @@ app.get('/', (req, res) => res.json({ status: 'online', version: '3.6.0-speaker-
 // WEBSOCKETS EN TIEMPO REAL
 io.on('connection', (socket) => {
 
-  socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password, isConsoleAdmin, rolConsola, nombreConsola }) => {
+  socket.on('auth:join', async ({ assemblyId, identificadorUnico, email, password, acceptedHabeasData, isConsoleAdmin, rolConsola, nombreConsola }) => {
     try {
       const targetAssembly = parseInt(assemblyId) || 1;
       const targetId = (identificadorUnico || '').toString().trim().toUpperCase();
@@ -2312,7 +2319,7 @@ io.on('connection', (socket) => {
       const targetPassword = (password || '').toString().trim();
 
       let [rows] = await db.query(
-        `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol 
+        `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol, acepta_habeas_data, fecha_habeas_data 
          FROM usuarios 
          WHERE assembly_id = ? AND (LOWER(email) = ? OR UPPER(identificador_unico) = ?)`,
         [targetAssembly, targetEmail || targetId.toLowerCase(), targetId]
@@ -2320,7 +2327,7 @@ io.on('connection', (socket) => {
 
       if (rows.length === 0 && (targetEmail || targetId)) {
         const [controlRows] = await db.query(
-          `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol 
+          `SELECT id, identificador_unico, nombre_completo, unidad, email, password, coeficiente, rol, acepta_habeas_data, fecha_habeas_data 
            FROM usuarios 
            WHERE (LOWER(email) = ? OR UPPER(identificador_unico) = ?) 
              AND rol IN ('administrador', 'soporte', 'moderador', 'representante_legal')
@@ -2352,22 +2359,25 @@ io.on('connection', (socket) => {
           nombre_completo: nombreConsola || 'Consola de Control',
           unidad: 'CONTROL',
           coeficiente: 0.00000,
-          rol: rolConsola || 'superadmin'
+          rol: rolConsola || 'superadmin',
+          acepta_habeas_data: 1
         }];
       }
 
       if (rows.length === 0 && targetId.startsWith('SOPORTE')) {
         const [ins] = await db.query(
-          `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol)
-           VALUES (?, ?, 'Soporte Técnico', 'SOPORTE', 0.00000, 'soporte')`,
+          `INSERT INTO usuarios (assembly_id, identificador_unico, nombre_completo, unidad, coeficiente, rol, acepta_habeas_data, fecha_habeas_data)
+           VALUES (?, ?, 'Soporte Técnico', 'SOPORTE', 0.00000, 'soporte', 1, NOW())`,
           [targetAssembly, targetId]
         );
-        rows = [{ id: ins.insertId, identificador_unico: targetId, nombre_completo: 'Soporte Técnico', unidad: 'SOPORTE', coeficiente: 0.00000, rol: 'soporte' }];
+        rows = [{ id: ins.insertId, identificador_unico: targetId, nombre_completo: 'Soporte Técnico', unidad: 'SOPORTE', coeficiente: 0.00000, rol: 'soporte', acepta_habeas_data: 1 }];
       }
 
       if (rows.length === 0) return socket.emit('auth:error', 'Usuario o correo no registrado.');
 
       const user = rows[0];
+      const userId = user.id;
+      const isControlRole = ['superadmin', 'administrador', 'moderador', 'representante_legal', 'soporte'].includes((user.rol || '').toLowerCase());
 
       if (!isConsoleAdmin && user.password && user.password.trim() !== '' && user.rol === 'asistente') {
         if (!targetPassword) {
@@ -2379,8 +2389,24 @@ io.on('connection', (socket) => {
         }
       }
 
-      const userId = user.id;
-      const isControlRole = ['superadmin', 'administrador', 'moderador', 'representante_legal', 'soporte'].includes((user.rol || '').toLowerCase());
+      // VALIDACIÓN Y TRAZABILIDAD LEGAL DE HÁBEAS DATA (LEY 1581 DE 2012)
+      if (!isConsoleAdmin && !isControlRole && userId > 0) {
+        const yaAceptoEnBD = user.acepta_habeas_data === 1;
+        if (!yaAceptoEnBD && !acceptedHabeasData) {
+          return socket.emit('auth:error', 'Debes aceptar la Política de Tratamiento de Datos Personales (Ley 1581 de 2012) para ingresar a la asamblea.');
+        }
+        if (acceptedHabeasData && !yaAceptoEnBD) {
+          try {
+            await db.query(
+              `UPDATE usuarios SET acepta_habeas_data = 1, fecha_habeas_data = NOW() WHERE id = ?`,
+              [userId]
+            );
+            user.acepta_habeas_data = 1;
+            user.fecha_habeas_data = new Date();
+          } catch (e) {}
+        }
+      }
+
       const sessionKey = (isConsoleAdmin || userId === 0)
         ? `${targetAssembly}_CONSOLE_${userId}_${socket.id}`
         : `${targetAssembly}_${userId}`;
@@ -2400,7 +2426,8 @@ io.on('connection', (socket) => {
           identificadorUnico: user.identificador_unico,
           nombreCompleto: user.nombre_completo,
           unidad: user.unidad,
-          rol: user.rol
+          rol: user.rol,
+          aceptaHabeasData: user.acepta_habeas_data === 1 || !!acceptedHabeasData
         });
         socketUserMap.set(socket.id, sessionKey);
         socket.sessionKey = sessionKey;
@@ -2422,6 +2449,7 @@ io.on('connection', (socket) => {
       user.isRepresented = isRepresented;
       user.poderesAprobados = representadosAprobados;
       user.poderesPendientes = representadosPendientes;
+      user.aceptaHabeasData = user.acepta_habeas_data === 1 || !!acceptedHabeasData;
 
       socket.emit('auth:success', { user, room: roomName });
 
@@ -2482,7 +2510,7 @@ io.on('connection', (socket) => {
       if (!assemblyId || !userId) return;
 
       const [rows] = await db.query(
-        `SELECT id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol FROM usuarios WHERE id = ?`,
+        `SELECT id, identificador_unico, nombre_completo, unidad, email, coeficiente, rol, acepta_habeas_data FROM usuarios WHERE id = ?`,
         [userId]
       );
       if (rows.length === 0) return;
@@ -2495,6 +2523,7 @@ io.on('connection', (socket) => {
       user.isRepresented = isRepresented;
       user.poderesAprobados = representadosAprobados;
       user.poderesPendientes = representadosPendientes;
+      user.aceptaHabeasData = user.acepta_habeas_data === 1;
 
       socket.emit('user:coef_updated', { user });
     } catch (err) {
