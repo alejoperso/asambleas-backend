@@ -1845,7 +1845,7 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
 
     const [rows] = await db.query(
       `SELECT p.id, p.assembly_id, p.otorgante_id, p.apoderado_id, p.documento_url, p.estado, p.observaciones, p.created_at,
-              u_ot.identificador_unico AS otorgante_identificador, u_ot.nombre_completo AS otorgante_nombre, u_ot.unidad AS otorgante_unidad, u_ot.coeficiente AS otorgante_coeficiente,
+              u_ot.identificador_unico AS otorgante_identificador, u_ot.nombre_completo AS otorgante_nombre, u_ot.unidad AS otorgante_unidad, u_ot.coeficiente AS otorgante_coeficiente, u_ot.coeficiente AS otorgante_coef,
               u_ap.identificador_unico AS apoderado_identificador, u_ap.nombre_completo AS apoderado_nombre, u_ap.unidad AS apoderado_unidad
        FROM poderes p
        JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
@@ -1862,8 +1862,8 @@ app.get('/api/powers/:assemblyId', async (req, res) => {
   }
 });
 
-// RADICAR UN PODER (DESDE INDEX.HTML O ASIGNACIÓN MANUAL DESDE ADMIN.HTML)
-app.post('/api/powers', async (req, res) => {
+// FUNCIÓN INTERNA PARA PROCESAR REGISTRO DE PODER (COMPARTIDA ENTRE /api/powers Y /api/powers/manual)
+async function procesarRegistroPoder(req, res, forzarManualAdmin = false) {
   try {
     const {
       assemblyId,
@@ -1871,6 +1871,7 @@ app.post('/api/powers', async (req, res) => {
       apoderadoUnico,
       otorganteId,
       apoderadoId,
+      apoderadoIdentificador,
       documentoUrl,
       estado,
       isAdminAssign,
@@ -1879,7 +1880,7 @@ app.post('/api/powers', async (req, res) => {
     } = req.body;
 
     const targetAssembly = parseInt(assemblyId) || 1;
-    const esAsignacionManualAdmin = Boolean(isAdminAssign || aprobadoPorAdmin || manualAdmin || estado === 'autorizado');
+    const esAsignacionManualAdmin = Boolean(forzarManualAdmin || isAdminAssign || aprobadoPorAdmin || manualAdmin || estado === 'autorizado');
 
     // Validar si la recepción virtual de poderes por parte de los copropietarios está habilitada en la asamblea
     if (!esAsignacionManualAdmin && !isAllowUserPowersForAssembly(targetAssembly)) {
@@ -1889,17 +1890,14 @@ app.post('/api/powers', async (req, res) => {
       });
     }
 
-    // Buscar Otorgante
+    // Buscar Otorgante (soporta ID único, unidad o ID interno)
     let otorganteRow = null;
-    if (otorganteId) {
-      const [r] = await db.query(`SELECT * FROM usuarios WHERE id = ? AND assembly_id = ? LIMIT 1`, [otorganteId, targetAssembly]);
-      if (r.length > 0) otorganteRow = r[0];
-    }
-    if (!otorganteRow && otorganteUnico) {
-      const cleanOt = String(otorganteUnico).trim().toUpperCase();
+    const rawOtorgante = otorganteUnico || otorganteId;
+    if (rawOtorgante) {
+      const cleanOt = String(rawOtorgante).trim().toUpperCase();
       const [r] = await db.query(
-        `SELECT * FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ?) LIMIT 1`,
-        [targetAssembly, cleanOt, cleanOt]
+        `SELECT * FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?) LIMIT 1`,
+        [targetAssembly, cleanOt, cleanOt, parseInt(rawOtorgante) || 0]
       );
       if (r.length > 0) otorganteRow = r[0];
     }
@@ -1908,17 +1906,14 @@ app.post('/api/powers', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'No se encontró la unidad o copropietario otorgante en el padrón de esta asamblea.' });
     }
 
-    // Buscar Apoderado
+    // Buscar Apoderado (soporta ID único, unidad o ID interno)
     let apoderadoRow = null;
-    if (apoderadoId) {
-      const [r] = await db.query(`SELECT * FROM usuarios WHERE id = ? AND assembly_id = ? LIMIT 1`, [apoderadoId, targetAssembly]);
-      if (r.length > 0) apoderadoRow = r[0];
-    }
-    if (!apoderadoRow && apoderadoUnico) {
-      const cleanAp = String(apoderadoUnico).trim().toUpperCase();
+    const rawApoderado = apoderadoUnico || apoderadoIdentificador || apoderadoId;
+    if (rawApoderado) {
+      const cleanAp = String(rawApoderado).trim().toUpperCase();
       const [r] = await db.query(
-        `SELECT * FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ?) LIMIT 1`,
-        [targetAssembly, cleanAp, cleanAp]
+        `SELECT * FROM usuarios WHERE assembly_id = ? AND (UPPER(identificador_unico) = ? OR UPPER(unidad) = ? OR id = ?) LIMIT 1`,
+        [targetAssembly, cleanAp, cleanAp, parseInt(rawApoderado) || 0]
       );
       if (r.length > 0) apoderadoRow = r[0];
     }
@@ -1931,29 +1926,72 @@ app.post('/api/powers', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Un copropietario no puede otorgarse un poder a sí mismo.' });
     }
 
-    // Verificar que el otorgante no haya dado él mismo poder ya a otro o no sea ya apoderado en cadena si aplica
-    const estadoInicial = esAsignacionManualAdmin ? (estado || 'autorizado') : 'pendiente';
-    const docFinal = documentoUrl || null;
-
-    const [insertRes] = await db.query(
-      `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado)
-       VALUES (?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         apoderado_id = VALUES(apoderado_id),
-         documento_url = COALESCE(VALUES(documento_url), documento_url),
-         estado = VALUES(estado),
-         created_at = CURRENT_TIMESTAMP`,
-      [targetAssembly, otorganteRow.id, apoderadoRow.id, docFinal, estadoInicial]
+    // BLINDAJE QUIRÚRGICO DE UNICIDAD: Verificar si este otorgante ya tiene un poder activo (autorizado o pendiente) en esta asamblea
+    const [existingPowers] = await db.query(
+      `SELECT p.id, p.apoderado_id, p.estado, u_ap.identificador_unico AS apoderado_identificador, u_ap.unidad AS apoderado_unidad, u_ap.nombre_completo AS apoderado_nombre
+       FROM poderes p
+       JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
+       WHERE p.assembly_id = ? AND p.otorgante_id = ? AND p.estado IN ('autorizado', 'pendiente')
+       ORDER BY FIELD(p.estado, 'autorizado', 'pendiente'), p.id DESC`,
+      [targetAssembly, otorganteRow.id]
     );
 
-    // obtener el ID real del registro de poder
-    let powerId = insertRes.insertId;
-    if (!powerId) {
-      const [existingRow] = await db.query(
-        `SELECT id FROM poderes WHERE assembly_id = ? AND otorgante_id = ? LIMIT 1`,
-        [targetAssembly, otorganteRow.id]
+    const yaAutorizado = existingPowers.find(p => p.estado === 'autorizado');
+    if (yaAutorizado) {
+      return res.status(400).json({
+        ok: false,
+        error: `La propiedad ${otorganteRow.identificador_unico} (${otorganteRow.nombre_completo}) ya tiene un poder AUTORIZADO a favor de ${yaAutorizado.apoderado_identificador} (${yaAutorizado.apoderado_nombre}). Debe eliminarse el poder actual si desea reasignarlo.`
+      });
+    }
+
+    const yaPendiente = existingPowers.find(p => p.estado === 'pendiente');
+    if (yaPendiente && !esAsignacionManualAdmin && parseInt(yaPendiente.apoderado_id) !== parseInt(apoderadoRow.id)) {
+      return res.status(400).json({
+        ok: false,
+        error: `La propiedad ${otorganteRow.identificador_unico} (${otorganteRow.nombre_completo}) ya tiene una solicitud de poder PENDIENTE de revisión a favor de ${yaPendiente.apoderado_identificador} (${yaPendiente.apoderado_nombre}).`
+      });
+    }
+
+    const estadoInicial = esAsignacionManualAdmin ? (estado || 'autorizado') : 'pendiente';
+    const docFinal = documentoUrl || null;
+    let powerId = null;
+
+    if (yaPendiente) {
+      // Actualizar la solicitud pendiente existente sin crear filas duplicadas
+      await db.query(
+        `UPDATE poderes
+         SET apoderado_id = ?, documento_url = COALESCE(?, documento_url), estado = ?, created_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [apoderadoRow.id, docFinal, estadoInicial, yaPendiente.id]
       );
-      if (existingRow.length > 0) powerId = existingRow[0].id;
+      powerId = yaPendiente.id;
+    } else {
+      const [insertRes] = await db.query(
+        `INSERT INTO poderes (assembly_id, otorgante_id, apoderado_id, documento_url, estado)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           apoderado_id = VALUES(apoderado_id),
+           documento_url = COALESCE(VALUES(documento_url), documento_url),
+           estado = VALUES(estado),
+           created_at = CURRENT_TIMESTAMP`,
+        [targetAssembly, otorganteRow.id, apoderadoRow.id, docFinal, estadoInicial]
+      );
+      powerId = insertRes.insertId;
+      if (!powerId) {
+        const [existingRow] = await db.query(
+          `SELECT id FROM poderes WHERE assembly_id = ? AND otorgante_id = ? ORDER BY id DESC LIMIT 1`,
+          [targetAssembly, otorganteRow.id]
+        );
+        if (existingRow.length > 0) powerId = existingRow[0].id;
+      }
+    }
+
+    // Si se autorizó directamente desde Admin, rechazar cualquier otro pendiente residual del mismo otorgante
+    if (estadoInicial === 'autorizado' && powerId) {
+      await db.query(
+        `UPDATE poderes SET estado = 'rechazado' WHERE assembly_id = ? AND otorgante_id = ? AND id != ? AND estado = 'pendiente'`,
+        [targetAssembly, otorganteRow.id, powerId]
+      );
     }
 
     const roomName = `assembly_${targetAssembly}`;
@@ -2035,10 +2073,19 @@ app.post('/api/powers', async (req, res) => {
     console.error('Error registrando poder:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
+}
+
+// RADICAR UN PODER (DESDE INDEX.HTML O ASIGNACIÓN MANUAL DESDE ADMIN.HTML)
+app.post('/api/powers', async (req, res) => {
+  await procesarRegistroPoder(req, res, false);
 });
 
-// APROBAR O RECHAZAR UN PODER DESDE ADMIN.HTML
-app.put('/api/powers/:id', async (req, res) => {
+app.post('/api/powers/manual', async (req, res) => {
+  await procesarRegistroPoder(req, res, true);
+});
+
+// FUNCIÓN INTERNA PARA ACTUALIZAR ESTADO DE PODER (SOPORTA /api/powers/:id Y /api/powers/:id/status)
+async function procesarCambioEstadoPoder(req, res) {
   try {
     const { id } = req.params;
     const { estado, observaciones } = req.body;
@@ -2047,17 +2094,51 @@ app.put('/api/powers/:id', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Estado de poder inválido.' });
     }
 
-    const [rows] = await db.query(`SELECT assembly_id FROM poderes WHERE id = ?`, [id]);
+    const [rows] = await db.query(
+      `SELECT p.id, p.assembly_id, p.otorgante_id, u_ot.identificador_unico AS otorgante_identificador, u_ot.nombre_completo AS otorgante_nombre
+       FROM poderes p
+       JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
+       WHERE p.id = ? LIMIT 1`,
+      [id]
+    );
     if (rows.length === 0) {
       return res.status(404).json({ ok: false, error: 'Registro de poder no encontrado.' });
     }
 
-    const targetAssembly = parseInt(rows[0].assembly_id) || 1;
+    const poderActual = rows[0];
+    const targetAssembly = parseInt(poderActual.assembly_id) || 1;
+
+    // BLINDAJE AL APROBAR: Verificar que el otorgante no tenga ya otro poder autorizado con otro usuario
+    if (estado === 'autorizado') {
+      const [dupRows] = await db.query(
+        `SELECT p.id, u_ap.identificador_unico AS apoderado_identificador, u_ap.nombre_completo AS apoderado_nombre
+         FROM poderes p
+         JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
+         WHERE p.assembly_id = ? AND p.otorgante_id = ? AND p.estado = 'autorizado' AND p.id != ?
+         LIMIT 1`,
+        [targetAssembly, poderActual.otorgante_id, id]
+      );
+
+      if (dupRows.length > 0) {
+        return res.status(400).json({
+          ok: false,
+          error: `No se puede aprobar: la propiedad ${poderActual.otorgante_identificador} (${poderActual.otorgante_nombre}) ya tiene un poder AUTORIZADO a favor de ${dupRows[0].apoderado_identificador} (${dupRows[0].apoderado_nombre}).`
+        });
+      }
+    }
 
     await db.query(
       `UPDATE poderes SET estado = ?, observaciones = ? WHERE id = ?`,
       [estado, observaciones || null, id]
     );
+
+    // Si se autorizó este poder, rechazar automáticamente cualquier otra solicitud pendiente del mismo otorgante
+    if (estado === 'autorizado') {
+      await db.query(
+        `UPDATE poderes SET estado = 'rechazado' WHERE assembly_id = ? AND otorgante_id = ? AND id != ? AND estado = 'pendiente'`,
+        [targetAssembly, poderActual.otorgante_id, id]
+      );
+    }
 
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('powers:updated');
@@ -2068,7 +2149,11 @@ app.put('/api/powers/:id', async (req, res) => {
     console.error('Error actualizando poder:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
-});
+}
+
+// APROBAR O RECHAZAR UN PODER DESDE ADMIN.HTML (AMBAS RUTAS COMPATIBLES)
+app.put('/api/powers/:id', procesarCambioEstadoPoder);
+app.put('/api/powers/:id/status', procesarCambioEstadoPoder);
 
 // ELIMINAR UN PODER DESDE ADMIN.HTML
 app.delete('/api/powers/:id', async (req, res) => {
@@ -2107,9 +2192,9 @@ app.get('/api/powers/:id/quick-action', async (req, res) => {
     }
 
     const [rows] = await db.query(
-      `SELECT p.id, p.assembly_id, p.estado,
-              u_ot.unidad AS otorgante_unidad, u_ot.nombre_completo AS otorgante_nombre,
-              u_ap.unidad AS apoderado_unidad, u_ap.nombre_completo AS apoderado_nombre
+      `SELECT p.id, p.assembly_id, p.otorgante_id, p.estado,
+              u_ot.identificador_unico AS otorgante_identificador, u_ot.unidad AS otorgante_unidad, u_ot.nombre_completo AS otorgante_nombre,
+              u_ap.identificador_unico AS apoderado_identificador, u_ap.unidad AS apoderado_unidad, u_ap.nombre_completo AS apoderado_nombre
        FROM poderes p
        JOIN usuarios u_ot ON p.otorgante_id = u_ot.id
        JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
@@ -2124,7 +2209,36 @@ app.get('/api/powers/:id/quick-action', async (req, res) => {
     const poder = rows[0];
     const targetAssembly = parseInt(poder.assembly_id) || 1;
 
+    // BLINDAJE EN ENLACE DE CORREO: Impedir doble autorización del mismo otorgante
+    if (action === 'autorizado') {
+      const [dupRows] = await db.query(
+        `SELECT p.id, u_ap.identificador_unico AS apoderado_identificador, u_ap.nombre_completo AS apoderado_nombre
+         FROM poderes p
+         JOIN usuarios u_ap ON p.apoderado_id = u_ap.id
+         WHERE p.assembly_id = ? AND p.otorgante_id = ? AND p.estado = 'autorizado' AND p.id != ?
+         LIMIT 1`,
+        [targetAssembly, poder.otorgante_id, id]
+      );
+
+      if (dupRows.length > 0) {
+        return res.status(400).send(
+          buildQuickActionResultHTML(
+            '⚠️ Propiedad Ya Representada',
+            `No se puede aprobar este poder porque la propiedad <strong>${poder.otorgante_identificador} (${poder.otorgante_nombre})</strong> ya tiene un poder <strong>AUTORIZADO</strong> a favor de <strong>${dupRows[0].apoderado_identificador} (${dupRows[0].apoderado_nombre})</strong>.`,
+            '#f59e0b'
+          )
+        );
+      }
+    }
+
     await db.query(`UPDATE poderes SET estado = ? WHERE id = ?`, [action, id]);
+
+    if (action === 'autorizado') {
+      await db.query(
+        `UPDATE poderes SET estado = 'rechazado' WHERE assembly_id = ? AND otorgante_id = ? AND id != ? AND estado = 'pendiente'`,
+        [targetAssembly, poder.otorgante_id, id]
+      );
+    }
 
     const roomName = `assembly_${targetAssembly}`;
     io.to(roomName).emit('powers:updated');
